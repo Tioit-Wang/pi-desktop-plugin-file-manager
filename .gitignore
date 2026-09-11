@@ -1,0 +1,13 @@
+# 依赖与构建中间产物
+views-src/node_modules/
+
+# 插件打包产物
+dist/
+
+# PI-Desktop 本地状态
+.pi/
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+*.log

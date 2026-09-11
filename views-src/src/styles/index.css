@@ -1,0 +1,451 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 宿主设计变量的镜像。视图页面拿不到宿主的 renderer CSS，只能自己复刻一份
+   （宿主内置 pi.files 的做法相同），这样面板调色板一变，这里跟着变。 */
+:root {
+  color-scheme: dark;
+  --bg: #181818;
+  --surface: #181818;
+  --surface-raised: #1f1f1f;
+  --surface-hover: color-mix(in oklab, #ffffff 6%, transparent);
+  --surface-active: color-mix(in oklab, #ffffff 10%, transparent);
+  --fg: #ffffff;
+  --secondary: color-mix(in oklab, #ffffff 70%, transparent);
+  --muted: color-mix(in oklab, #ffffff 52%, transparent);
+  --faint: color-mix(in oklab, #ffffff 38%, transparent);
+  --border: color-mix(in oklab, #ffffff 5%, transparent);
+  --border-strong: color-mix(in oklab, #ffffff 14%, transparent);
+  --accent: #ffffff;
+  --danger: #ff6764;
+  --icon-folder: color-mix(in oklab, #ffffff 46%, transparent);
+  --icon-doc: color-mix(in oklab, #ffffff 58%, transparent);
+  --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
+
+:root[data-base="light"] {
+  color-scheme: light;
+  --bg: #fafafa;
+  --surface: #ffffff;
+  --surface-raised: #f3f3f3;
+  --surface-hover: color-mix(in oklab, #1a1c1f 5%, transparent);
+  --surface-active: color-mix(in oklab, #1a1c1f 8%, transparent);
+  --fg: #1a1c1f;
+  --secondary: color-mix(in oklab, #1a1c1f 74%, transparent);
+  --muted: #5d5d5d;
+  --faint: #9a9a9a;
+  --border: color-mix(in oklab, #1a1c1f 5%, transparent);
+  --border-strong: color-mix(in oklab, #1a1c1f 12%, transparent);
+  --accent: #1a1c1f;
+  --danger: #e02e2a;
+  --icon-folder: #c99a3c;
+  --icon-doc: #6b7280;
+}
+
+/* Tailwind preflight 已关闭，这里给出最小必要的基础样式。 */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  /* 嵌入态为 0px，独立面板窗为 46px——用变量而不是写死值。 */
+  padding-top: var(--pi-plugin-titlebar-height, 0px);
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--fg);
+  font:
+    12px/1.45 -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    system-ui,
+    "PingFang SC",
+    "Microsoft YaHei",
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+#root {
+  height: 100%;
+  min-height: 0;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+}
+
+input {
+  font: inherit;
+  color: inherit;
+}
+
+button:focus-visible,
+input:focus-visible {
+  outline: 2px solid color-mix(in oklab, var(--accent) 58%, transparent);
+  outline-offset: -2px;
+}
+
+/* 细滚动条，跟随面板配色。 */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: 8px;
+  background-clip: content-box;
+  background-color: color-mix(in oklab, var(--fg) 18%, transparent);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: color-mix(in oklab, var(--fg) 30%, transparent);
+}
+
+::-webkit-scrollbar-corner,
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ── CodeMirror 6：让编辑器跟随宿主调色板 ──────────────────────────────── */
+
+.cm-editor {
+  height: 100%;
+  background: transparent;
+}
+
+.cm-editor .cm-scroller {
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.cm-editor.cm-focused {
+  outline: none;
+}
+
+.cm-editor .cm-gutters {
+  border-right: 1px solid var(--border);
+  background: transparent;
+  color: var(--faint);
+}
+
+.cm-editor .cm-activeLine {
+  background: color-mix(in oklab, var(--fg) 4%, transparent);
+}
+
+.cm-editor .cm-activeLineGutter {
+  background: color-mix(in oklab, var(--fg) 4%, transparent);
+}
+
+.cm-editor .cm-selectionBackground,
+.cm-editor .cm-content ::selection {
+  background: color-mix(in oklab, var(--accent) 22%, transparent) !important;
+}
+
+.cm-editor .cm-cursor,
+.cm-editor .cm-dropCursor {
+  border-left-color: var(--fg);
+}
+
+.cm-editor .cm-panels {
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-raised);
+  color: var(--fg);
+}
+
+.cm-editor .cm-panels.cm-panels-bottom {
+  border-top: 1px solid var(--border);
+  border-bottom: none;
+}
+
+.cm-editor .cm-searchMatch {
+  background: color-mix(in oklab, #f5c542 40%, transparent);
+}
+
+.cm-editor .cm-searchMatch.cm-searchMatch-selected {
+  background: color-mix(in oklab, #f5c542 70%, transparent);
+}
+
+.cm-editor .cm-tooltip {
+  border: 1px solid var(--border-strong);
+  background: var(--surface-raised);
+  color: var(--fg);
+}
+
+.cm-editor .cm-foldPlaceholder {
+  border: 1px solid var(--border);
+  background: var(--surface-hover);
+  color: var(--secondary);
+}
+
+/* ── 文件树 ───────────────────────────────────────────────────────────────
+   选中态与悬停态必须一眼可分：
+     悬停 = 中性、很淡（6% 前景），只表示「鼠标在这儿」；
+     选中 = 强调色底（18% 强调色）+ 左侧 2px 强调色竖条 + 前景色文字 +
+            中等字重，即使鼠标移开也保持。
+   用 data-selected 而不是 :hover 覆盖，避免悬停时把选中态盖掉。 */
+
+.tree-row {
+  display: flex;
+  width: 100%;
+  min-height: 24px;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  border-radius: 6px;
+  padding: 3px 8px 3px 6px;
+  background: transparent;
+  color: var(--secondary);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1.45;
+  text-align: left;
+  transition:
+    background 150ms cubic-bezier(0.22, 1, 0.36, 1),
+    color 150ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.tree-row:hover:not([data-selected="true"]) {
+  background: var(--surface-hover);
+  color: var(--fg);
+}
+
+.tree-row[data-selected="true"] {
+  background: color-mix(in oklab, var(--accent) 18%, transparent);
+  box-shadow: inset 2px 0 0 var(--accent);
+  color: var(--fg);
+  font-weight: 500;
+}
+
+/* 选中态在悬停时也保持明显，只是再加深一点，避免看起来「掉了选中」。 */
+.tree-row[data-selected="true"]:hover {
+  background: color-mix(in oklab, var(--accent) 24%, transparent);
+}
+
+.tree-row:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.tree-row:disabled:hover {
+  background: transparent;
+}
+
+.tree-row[data-ignored="true"] {
+  color: var(--faint);
+  font-style: italic;
+}
+
+.tree-row[data-ignored="true"] .tree-icon,
+.tree-row[data-ignored="true"] svg {
+  opacity: 0.65;
+}
+
+.tree-row .tree-name {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tree-row .tree-caret {
+  display: inline-flex;
+  width: 12px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  color: var(--faint);
+  transition: transform 150ms ease-out;
+}
+
+.tree-row .tree-size,
+.tree-row .tree-mark {
+  flex: 0 0 auto;
+  color: var(--faint);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.tree-row[data-selected="true"] .tree-caret,
+.tree-row[data-selected="true"] .tree-size,
+.tree-row[data-selected="true"] .tree-mark {
+  color: color-mix(in oklab, var(--fg) 70%, transparent);
+}
+
+/* 选中行的图标保留满色，普通行略降，选中因此更「亮」。 */
+.tree-row:not([data-selected="true"]) svg {
+  opacity: 0.92;
+}
+
+/* ── Markdown 预览 ─────────────────────────────────────────────────────── */
+
+.md-scroll {
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
+  padding: 4px 20px 64px;
+}
+
+.md-body {
+  max-width: 78ch;
+  color: var(--fg);
+  font-size: 13px;
+  line-height: 1.7;
+  word-wrap: break-word;
+}
+
+.md-body > *:first-child {
+  margin-top: 0;
+}
+
+.md-h1,
+.md-h2,
+.md-h3,
+.md-h4,
+.md-h5,
+.md-h6 {
+  margin: 1.5em 0 0.6em;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.md-h1 {
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid var(--border);
+  font-size: 1.7em;
+}
+
+.md-h2 {
+  padding-bottom: 0.25em;
+  border-bottom: 1px solid var(--border);
+  font-size: 1.4em;
+}
+
+.md-h3 { font-size: 1.2em; }
+.md-h4 { font-size: 1.06em; }
+.md-h5 { font-size: 1em; color: var(--secondary); }
+.md-h6 { font-size: 0.94em; color: var(--muted); }
+
+.md-p {
+  margin: 0.75em 0;
+  white-space: pre-wrap;
+}
+
+.md-inline-code {
+  border-radius: 4px;
+  padding: 0.12em 0.36em;
+  background: color-mix(in oklab, var(--fg) 9%, transparent);
+  font-family: var(--mono);
+  font-size: 0.88em;
+}
+
+.md-code {
+  margin: 0.9em 0;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: color-mix(in oklab, var(--fg) 4%, transparent);
+  font-family: var(--mono);
+  font-size: 0.88em;
+  line-height: 1.55;
+}
+
+.md-code code {
+  white-space: pre;
+}
+
+.md-quote {
+  margin: 0.9em 0;
+  border-left: 3px solid color-mix(in oklab, var(--fg) 18%, transparent);
+  padding: 0.1em 0 0.1em 1em;
+  color: var(--secondary);
+}
+
+.md-hr {
+  height: 1px;
+  margin: 1.6em 0;
+  border: 0;
+  background: var(--border-strong);
+}
+
+.md-list {
+  margin: 0.7em 0;
+  padding-left: 1.5em;
+}
+
+.md-li {
+  margin: 0.25em 0;
+}
+
+.md-li-task {
+  list-style: none;
+  margin-left: -1.35em;
+}
+
+.md-task {
+  margin-right: 0.5em;
+  vertical-align: middle;
+  accent-color: var(--accent);
+}
+
+.md-table-wrap {
+  margin: 0.9em 0;
+  overflow-x: auto;
+}
+
+.md-table {
+  border-collapse: collapse;
+  font-size: 0.95em;
+}
+
+.md-table th,
+.md-table td {
+  border: 1px solid var(--border-strong);
+  padding: 5px 10px;
+}
+
+.md-table th {
+  background: color-mix(in oklab, var(--fg) 5%, transparent);
+  font-weight: 600;
+}
+
+.md-link {
+  color: #4aa3d9;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.md-link-unsafe {
+  color: var(--danger);
+  text-decoration-style: dotted;
+}
+
+.md-image {
+  display: inline-block;
+  border-radius: 6px;
+  padding: 0.1em 0.45em;
+  background: color-mix(in oklab, var(--fg) 7%, transparent);
+  color: var(--muted);
+  font-size: 0.92em;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+    animation: none !important;
+  }
+}
