@@ -28,7 +28,7 @@
 在 PI-Desktop 的 Plugins 页面：
 
 1. **Load development plugin** → 选择本目录；或
-2. 用 `dist/pi.file-manager-0.3.0.piplug` 走 **Install plugin package**。
+2. 用 `dist/pi.file-manager-0.3.1.piplug` 走 **Install plugin package**。
 
 装好后打开一个项目，在**右侧工作面板头部的切换菜单 → “Plugin views / 插件视图”** 分组里点击「文件管理器」。
 
