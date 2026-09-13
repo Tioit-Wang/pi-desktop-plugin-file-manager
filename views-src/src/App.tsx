@@ -7,6 +7,7 @@ import { baseNameOf, parentOf } from "./lib/format";
 import { makeT, type T } from "./i18n";
 import { resolveViewer, type ViewerMode } from "./lib/viewers";
 import { toOpenFile, withSavedContent, type OpenFile } from "./lib/openFile";
+import { openWithDefaultApp, revealInFileManager } from "./lib/hostActions";
 import { Tree, type DirState } from "./components/Tree";
 import { EditorPane } from "./components/EditorPane";
 import { ConfirmDialog, PromptDialog } from "./components/Dialogs";
@@ -488,6 +489,20 @@ export default function App() {
     [],
   );
 
+  /**
+   * 「用默认应用打开」与「在文件夹中显示」由宿主代为执行（fs.openDefault / fs.reveal），
+   * 受 manifest 里声明的 fs.read 范围约束，且只对文件有效。
+   * 失败走 toast 而不是插件的错误横幅——这两件事与当前打开的文件无关。
+   */
+  const runHostAction = useCallback((action: "open" | "reveal", path: string) => {
+    const run = action === "open" ? openWithDefaultApp : revealInFileManager;
+    void run(path).catch(() => {
+      void invoke("ui.showToast", {
+        message: tRef.current(action === "open" ? "openError" : "revealError"),
+      }).catch(() => {});
+    });
+  }, []);
+
   // 结构化视图（Markdown 预览 / 表格 / 树）只对文本文件成立；具体有哪几种、
   // 默认落在哪一侧，全部由 lib/viewers.ts 一处判定，偏好决定默认值。
   const viewer = openFile && openFile.kind === "text" ? resolveViewer(openFile.path, prefs) : null;
@@ -537,11 +552,27 @@ export default function App() {
     ];
 
     if (target && !isDir) {
-      entries.splice(3, 0, {
-        kind: "item",
-        label: t("open"),
-        onPick: () => withGuard(() => void openEntry(target)),
-      });
+      // 三个都是「对这个文件动手」，插在分隔线之后、重命名之前。
+      // 后两个交给宿主执行，且只对文件有效（宿主会对目录报 INVALID_ARGUMENT）。
+      entries.splice(
+        3,
+        0,
+        {
+          kind: "item",
+          label: t("open"),
+          onPick: () => withGuard(() => void openEntry(target)),
+        },
+        {
+          kind: "item",
+          label: t("openWithApp"),
+          onPick: () => runHostAction("open", target.path),
+        },
+        {
+          kind: "item",
+          label: t("revealInFolder"),
+          onPick: () => runHostAction("reveal", target.path),
+        },
+      );
     }
     return entries;
   };
