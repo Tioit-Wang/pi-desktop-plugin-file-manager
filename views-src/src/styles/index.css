@@ -21,6 +21,11 @@
   --danger: #ff6764;
   --icon-folder: color-mix(in oklab, #ffffff 46%, transparent);
   --icon-doc: color-mix(in oklab, #ffffff 58%, transparent);
+  /* JSON 树的取值配色，与 lib/highlight.ts 的深色高亮表一致 */
+  --json-key: #e06c75;
+  --json-string: #98c379;
+  --json-number: #d19a66;
+  --json-literal: #c678dd;
   --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
 }
 
@@ -41,6 +46,10 @@
   --danger: #e02e2a;
   --icon-folder: #c99a3c;
   --icon-doc: #6b7280;
+  --json-key: #e45649;
+  --json-string: #50a14f;
+  --json-number: #986801;
+  --json-literal: #a626a4;
 }
 
 /* Tailwind preflight 已关闭，这里给出最小必要的基础样式。 */
@@ -289,11 +298,24 @@ input:focus-visible {
   opacity: 0.92;
 }
 
+/* ── 查看器（预览 / 图片 / 播放器 / 表格 / 树）─────────────────────────────
+   四种看法共用内容区那一块定高、overflow:hidden 的位置，所以一律绝对定位铺满。
+   以前的 .md-scroll 是普通流里的子块（height:auto）——长文档会被父级裁掉，
+   而且因为高度没被约束，overflow:auto 根本不会出现滚动条。 */
+
+.md-scroll,
+.dt-view,
+.dt-empty,
+.json-scroll,
+.img-stage,
+.media-stage {
+  position: absolute;
+  inset: 0;
+}
+
 /* ── Markdown 预览 ─────────────────────────────────────────────────────── */
 
 .md-scroll {
-  min-height: 0;
-  flex: 1;
   overflow: auto;
   padding: 4px 20px 64px;
 }
@@ -441,6 +463,768 @@ input:focus-visible {
   background: color-mix(in oklab, var(--fg) 7%, transparent);
   color: var(--muted);
   font-size: 0.92em;
+}
+
+/* ── 图片查看 ───────────────────────────────────────────────────────────── */
+
+.img-stage {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+
+.img-canvas {
+  /* 用 margin:auto 而不是 justify-content:center 做居中：图片比容器大时，
+     居中会把左上角推到可视区之外且滚不到。 */
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
+  padding: 16px;
+  background-color: var(--surface);
+  background-image:
+    linear-gradient(
+      45deg,
+      color-mix(in oklab, var(--fg) 5%, transparent) 25%,
+      transparent 25%,
+      transparent 75%,
+      color-mix(in oklab, var(--fg) 5%, transparent) 75%
+    ),
+    linear-gradient(
+      45deg,
+      color-mix(in oklab, var(--fg) 5%, transparent) 25%,
+      transparent 25%,
+      transparent 75%,
+      color-mix(in oklab, var(--fg) 5%, transparent) 75%
+    );
+  background-size: 16px 16px;
+  background-position: 0 0, 8px 8px;
+}
+
+.img-canvas img {
+  max-width: 100%;
+  max-height: 100%;
+  margin: auto;
+  object-fit: contain;
+  user-select: none;
+}
+
+/* 实际大小：解除约束，交给滚动条。 */
+.img-stage[data-actual="true"] .img-canvas img {
+  max-width: none;
+  max-height: none;
+}
+
+.img-bar {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 10px;
+  border-top: 1px solid var(--border);
+  padding: 6px 12px;
+  color: var(--muted);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.img-bar .img-dims {
+  color: var(--secondary);
+}
+
+.img-zoom {
+  margin-left: auto;
+  border: 0;
+  border-radius: 999px;
+  padding: 3px 10px;
+  background: var(--surface-hover);
+  color: var(--secondary);
+  cursor: pointer;
+  font-size: 10.5px;
+  transition: background 150ms ease-out, color 150ms ease-out;
+}
+
+.img-zoom:hover {
+  background: var(--surface-active);
+  color: var(--fg);
+}
+
+/* ── 音视频播放 ─────────────────────────────────────────────────────────── */
+
+.media-stage {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 24px;
+  background: var(--bg);
+}
+
+.media-box {
+  display: flex;
+  width: 100%;
+  justify-content: center;
+}
+
+.media-box video {
+  max-width: 100%;
+  max-height: 62vh;
+  border-radius: 8px;
+  background: #000;
+}
+
+.media-box audio {
+  width: 100%;
+  max-width: 520px;
+}
+
+.media-meta {
+  display: flex;
+  max-width: 100%;
+  align-items: center;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.media-meta .media-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+}
+
+.media-error {
+  border-radius: 8px;
+  padding: 6px 12px;
+  background: color-mix(in oklab, var(--danger) 14%, transparent);
+  color: var(--danger);
+  font-size: 11.5px;
+}
+
+/* ── 分隔符文本表格 ───────────────────────────────────────────────────────
+   结构是三段：.dt-view（铺满）→ .dt-scroll（只让表格滚）+ .dt-bar（底部钉住）。
+   表头吸顶、行号列吸左——表格通常比面板宽，两条都要固定住才找得到位置。
+   吸顶/吸左的格子背景必须是不透明的，否则下面的内容会透上来。 */
+
+.dt-view {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+
+.dt-scroll {
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
+}
+
+.dt-table {
+  min-width: 100%;
+  /* 用 separate 而不是 collapse：collapse 下吸顶/吸左格子的边框会随内容一起滚走 */
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.dt-table th,
+.dt-table td {
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  padding: 4px 10px;
+  text-align: left;
+  max-width: 36ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dt-table td {
+  color: var(--secondary);
+}
+
+/* 数字列右对齐：小数点对得齐，量级才一眼看得出来 */
+.dt-table td[data-numeric="true"] {
+  text-align: right;
+}
+
+/* 斑马纹 + 悬停：横向扫一行时不串行 */
+.dt-table tbody tr:nth-child(even) td {
+  background: color-mix(in oklab, var(--fg) 2.5%, var(--bg));
+}
+
+.dt-table tbody tr:hover td {
+  background: color-mix(in oklab, var(--fg) 7%, var(--bg));
+  color: var(--fg);
+}
+
+.dt-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--surface-raised);
+  color: var(--fg);
+  font-weight: 600;
+}
+
+/* ── 可排序表头 ───────────────────────────────────────────────────────────
+   整格都是按钮：一下升序、两下降序、三下回到文件原序（行号列会把原序显示出来，
+   所以「取消排序」是有意义的，不只是复位）。箭头只在不排序时留出宽度，
+   六十列也不会满屏噪声。 */
+
+.dt-table thead th.dt-sortable {
+  padding: 0;
+}
+
+.dt-sort {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 4px;
+  border: 0;
+  padding: 4px 10px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
+  text-align: left;
+  transition: background 150ms ease-out;
+}
+
+.dt-sort:hover {
+  background: color-mix(in oklab, var(--fg) 8%, var(--surface-raised));
+}
+
+.dt-sort .dt-head {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dt-sort .dt-arrow {
+  flex: 0 0 auto;
+  width: 1ch;
+  color: var(--faint);
+  font-size: 9px;
+}
+
+.dt-sort[data-active="true"] {
+  color: var(--fg);
+}
+
+.dt-sort[data-active="true"] .dt-arrow {
+  color: var(--fg);
+}
+
+.dt-table .dt-index {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  width: 1%;
+  min-width: 5ch;
+  padding-right: 8px;
+  background: var(--bg);
+  color: var(--faint);
+  font-size: 10px;
+  text-align: right;
+}
+
+.dt-table thead .dt-index {
+  z-index: 3;
+  background: var(--surface-raised);
+}
+
+.dt-table tbody tr:nth-child(even) .dt-index {
+  background: color-mix(in oklab, var(--fg) 2.5%, var(--bg));
+}
+
+.dt-table tbody tr:hover .dt-index {
+  background: color-mix(in oklab, var(--fg) 7%, var(--bg));
+  color: var(--secondary);
+}
+
+/* 底部：行数范围 · 翻页 · 每页行数 */
+.dt-bar {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+  border-top: 1px solid var(--border);
+  padding: 5px 10px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 10.5px;
+}
+
+.dt-bar .dt-range {
+  color: var(--secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.dt-bar .dt-warn {
+  color: var(--faint);
+}
+
+.dt-pager {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  margin-left: auto;
+}
+
+.dt-pager button {
+  display: inline-flex;
+  min-width: 20px;
+  height: 20px;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--secondary);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  transition: background 150ms ease-out, color 150ms ease-out;
+}
+
+.dt-pager button:hover:not(:disabled) {
+  background: var(--surface-hover);
+  color: var(--fg);
+}
+
+.dt-pager button:disabled {
+  cursor: default;
+  opacity: 0.35;
+}
+
+.dt-page {
+  min-width: 8ch;
+  text-align: center;
+  color: var(--secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.dt-size {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+}
+
+.dt-size select {
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  padding: 1px 4px;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+  cursor: pointer;
+}
+
+.dt-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* ── JSON 折叠树 ────────────────────────────────────────────────────────── */
+
+.json-scroll {
+  overflow: auto;
+  padding: 6px 0 32px;
+  background: var(--bg);
+}
+
+.json-body {
+  min-width: min-content;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.65;
+}
+
+.json-row {
+  display: flex;
+  width: 100%;
+  align-items: baseline;
+  gap: 6px;
+  border: 0;
+  padding: 1px 12px;
+  background: transparent;
+  color: var(--secondary);
+  text-align: left;
+}
+
+button.json-row {
+  cursor: pointer;
+}
+
+button.json-row:hover {
+  background: var(--surface-hover);
+}
+
+.json-caret {
+  flex: 0 0 auto;
+  width: 10px;
+  color: var(--faint);
+  font-size: 9px;
+}
+
+.json-key {
+  flex: 0 0 auto;
+  color: var(--json-key);
+}
+
+.json-key::after {
+  content: ":";
+  margin-left: 1px;
+  color: var(--faint);
+}
+
+.json-string {
+  color: var(--json-string);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.json-number {
+  color: var(--json-number);
+}
+
+.json-boolean {
+  color: var(--json-literal);
+}
+
+.json-null {
+  color: var(--muted);
+}
+
+.json-brace,
+.json-count {
+  flex: 0 0 auto;
+  color: var(--faint);
+}
+
+.json-count {
+  font-size: 10.5px;
+}
+
+.json-more {
+  display: block;
+  border: 0;
+  padding: 1px 12px;
+  background: transparent;
+  color: #4aa3d9;
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.json-more:hover {
+  text-decoration: underline;
+}
+
+.json-error {
+  padding: 12px 16px;
+  color: var(--danger);
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+
+/* ── SQLite 查看器 ───────────────────────────────────────────────────────
+   上层是概览条 / 页签 / 工具条，下面是共用表格；表格在这一层要退回普通流，
+   才能跟着 flex 撑满剩余高度（.dt-view 默认是绝对定位铺满内容区）。 */
+
+.sq-view {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+
+.sq-view .dt-view {
+  position: static;
+  min-height: 0;
+  flex: 1;
+}
+
+.sq-view .dt-scroll {
+  min-height: 0;
+}
+
+.sq-info {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  border-bottom: 1px solid var(--border);
+  padding: 5px 10px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.sq-info .sq-name {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.sq-badge {
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  padding: 0 6px;
+  color: var(--secondary);
+}
+
+.sq-warn {
+  flex: 0 0 auto;
+  border-bottom: 1px solid var(--border);
+  padding: 5px 10px;
+  background: color-mix(in oklab, #f5c542 14%, transparent);
+  color: color-mix(in oklab, #f5c542 62%, var(--fg));
+  font-size: 10.5px;
+}
+
+.sq-notice {
+  flex: 0 0 auto;
+  padding: 10px 12px;
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+.sq-danger {
+  color: var(--danger);
+}
+
+.sq-tabs {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 2px;
+  border-bottom: 1px solid var(--border);
+  padding: 4px 8px 0;
+  background: var(--surface);
+}
+
+.sq-tab {
+  border: 0;
+  border-bottom: 2px solid transparent;
+  padding: 4px 10px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 11.5px;
+}
+
+.sq-tab:hover {
+  color: var(--fg);
+}
+
+.sq-tab[data-active="true"] {
+  border-bottom-color: var(--accent);
+  color: var(--fg);
+  font-weight: 600;
+}
+
+.sq-bar {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  padding: 6px 8px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 10.5px;
+}
+
+.sq-select,
+.sq-size select {
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  padding: 1px 4px;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+  max-width: 100%;
+}
+
+.sq-select {
+  min-width: 0;
+  flex: 1 1 110px;
+}
+
+.sq-size {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+.sq-toggle,
+.sq-run {
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  padding: 2px 8px;
+  background: transparent;
+  color: var(--secondary);
+  cursor: pointer;
+  font-size: 10.5px;
+  transition: background 150ms ease-out, color 150ms ease-out;
+}
+
+.sq-toggle:hover:not(:disabled) {
+  background: var(--surface-hover);
+  color: var(--fg);
+}
+
+.sq-toggle[data-active="true"] {
+  background: var(--surface-active);
+  color: var(--fg);
+}
+
+.sq-toggle:disabled,
+.sq-run:disabled {
+  cursor: default;
+  opacity: 0.4;
+}
+
+.sq-run {
+  border-color: transparent;
+  background: var(--accent);
+  color: var(--bg);
+  font-weight: 600;
+}
+
+.sq-hint {
+  color: var(--faint);
+}
+
+.sq-editor {
+  flex: 0 0 auto;
+  height: 108px;
+  min-height: 64px;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  padding: 8px 10px;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.6;
+  outline: none;
+  resize: vertical;
+}
+
+.sq-result {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+}
+
+.sq-result-meta {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 5px 10px;
+  color: var(--muted);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.sq-structure {
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
+  padding: 10px 12px 24px;
+}
+
+.sq-struct-title {
+  margin: 14px 0 4px;
+  color: var(--muted);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.sq-struct-title:first-child {
+  margin-top: 0;
+}
+
+.sq-struct-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.sq-struct-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 2px 0;
+  color: var(--secondary);
+  font-size: 11.5px;
+}
+
+.sq-col-name {
+  color: var(--fg);
+  font-family: var(--mono);
+}
+
+.sq-col-type {
+  color: var(--muted);
+  font-size: 10.5px;
+}
+
+.sq-flag {
+  border-radius: 4px;
+  padding: 0 4px;
+  background: var(--surface-hover);
+  color: var(--faint);
+  font-size: 9.5px;
+}
+
+.sq-sql {
+  margin: 0;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: color-mix(in oklab, var(--fg) 4%, transparent);
+  color: var(--secondary);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+
+/* 表格：NULL 与「取数中」 */
+.dt-null {
+  color: var(--faint);
+  font-style: italic;
+}
+
+.dt-view[data-busy="true"] .dt-scroll {
+  opacity: 0.5;
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -1,23 +1,17 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createEditor, type EditorHandle } from "../lib/editor";
 import type { Base } from "../lib/appearance";
 import type { T } from "../i18n";
-import { formatSize, formatTime } from "../lib/format";
+import { baseNameOf, formatSize, formatTime } from "../lib/format";
 import { FileIcon } from "../lib/fileIcons";
-import { isMarkdown } from "../lib/languages";
 import { MarkdownPreview } from "../lib/markdown";
-
-export type OpenFile = {
-  path: string;
-  kind: "text" | "binary" | "image" | "tooLarge";
-  text: string;
-  eol: "lf" | "crlf";
-  bom: boolean;
-  size: number;
-  mtimeMs: number;
-};
-
-export type MdMode = "edit" | "preview";
+import { MODE_LABEL, csvDelimiterOf, type ViewerMode, type ViewerView } from "../lib/viewers";
+import { isDocumentLoaded, type OpenFile } from "../lib/openFile";
+import { CsvTable } from "./CsvTable";
+import { ImageView } from "./ImageView";
+import { JsonTree } from "./JsonTree";
+import { MediaPlayer } from "./MediaPlayer";
+import { SqliteView } from "./SqliteView";
 
 type Props = {
   file: OpenFile | null;
@@ -26,13 +20,17 @@ type Props = {
   dirty: boolean;
   saving: boolean;
   error: string | null;
-  mdMode: MdMode;
+  /** 当前文件可用的视图模式（源码 / Markdown / 表格 / 树）；纯文本为 null。 */
+  viewer: ViewerView | null;
+  /** 表格每页行数（偏好里记着）。 */
+  tablePageSize: number;
   t: T;
   handleRef: React.MutableRefObject<EditorHandle | null>;
   onDirty: () => void;
   onSave: () => void;
   onReload: () => void;
-  onMdMode: (mode: MdMode) => void;
+  onViewerMode: (mode: ViewerMode) => void;
+  onTablePageSize: (size: number) => void;
   onLink: (url: string) => void;
 };
 
@@ -43,16 +41,20 @@ export function EditorPane({
   dirty,
   saving,
   error,
-  mdMode,
+  viewer,
+  tablePageSize,
   t,
   handleRef,
   onDirty,
   onSave,
   onReload,
-  onMdMode,
+  onViewerMode,
+  onTablePageSize,
   onLink,
 }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
+  // 编辑器里装的是哪一次「从磁盘读进来」的内容；null = 还没装。
+  const [loadedToken, setLoadedToken] = useState<number | null>(null);
 
   // 编辑器只在挂载时创建一次，所以回调必须经 ref 转发，
   // 否则 Ctrl+S 会一直调用「首帧那次渲染」闭包里的 onSave（那时还没有打开文件）。
@@ -79,30 +81,52 @@ export function EditorPane({
     handleRef.current?.setBase(base);
   }, [base, handleRef]);
 
+  // 只有「从磁盘重新装载」才替换文档。保存成功后 openFile 也会换新对象
+  // （mtime / size 变了），但 loadToken 不变——那一步必须原样跳过，否则会把
+  // 用户刚写的内容换成打开时那份，光标与滚动位置也一起丢。
   useEffect(() => {
-    if (!file) return;
+    if (!file) {
+      if (loadedToken !== null) setLoadedToken(null);
+      return;
+    }
+    if (loadedToken === file.loadToken) return;
     handleRef.current?.setDocument(file.text, file.path, file.kind !== "text");
-  }, [file, handleRef]);
+    setLoadedToken(file.loadToken);
+  }, [file, loadedToken, handleRef]);
 
-  // 预览时编辑器必须藏起来、且要 false 掉 CodeMirror 的测量：
+  // 预览、表格、树渲染的是「编辑器里当前那份文本」，不是打开时的那份：
+  // 改完再切过去必须看到刚写的内容。文件刚换、上面的 effect 还没跑时，
+  // handle 里装的仍是上一个文件，此时退回 file.text（保存后它也是最新的）。
+  const mode = viewer?.mode ?? "source";
+  const structured = Boolean(file && viewer && mode !== "source");
+  const imageSrc = file?.kind === "image" ? file.dataUri : undefined;
+  const mediaSrc = file?.kind === "media" ? file.dataUri : undefined;
+  const sqlite = file?.kind === "sqlite" ? file.sqlite : undefined;
+  const editorHidden = structured || Boolean(imageSrc) || Boolean(mediaSrc) || Boolean(sqlite);
+
+  const liveText =
+    isDocumentLoaded(file, loadedToken) && file
+      ? handleRef.current?.text() ?? file.text
+      : file?.text ?? "";
+  const structuredText = structured ? liveText : "";
+
+  // 预览或查看器占位时编辑器必须藏起来、且要 false 掉 CodeMirror 的测量：
   // 它在 display:none 的容器里量不到尺寸，回到编辑态会排版错乱。
-  const previewing = Boolean(file && file.kind === "text" && isMarkdown(file.path) && mdMode === "preview");
   useEffect(() => {
     if (!hostRef.current) return;
-    hostRef.current.style.display = previewing ? "none" : "";
-    if (!previewing) handleRef.current?.view.requestMeasure();
-  }, [previewing, handleRef]);
+    hostRef.current.style.display = editorHidden ? "none" : "";
+    if (!editorHidden) handleRef.current?.view.requestMeasure();
+  }, [editorHidden, handleRef]);
 
+  // 图片与音视频是「查看」而不是「编辑」，不再挂只读横幅——换成查看器本身。
   const readOnlyReason =
     file && file.kind !== "text"
       ? file.kind === "binary"
         ? t("binary")
-        : file.kind === "image"
-          ? t("image")
-          : t("tooLarge")
+        : file.kind === "tooLarge"
+          ? t("tooLarge")
+          : null
       : null;
-
-  const markdown = Boolean(file && file.kind === "text" && isMarkdown(file.path));
 
   return (
     <section className="relative flex min-h-0 min-w-0 flex-1 flex-col" aria-label={t("title")}>
@@ -112,7 +136,7 @@ export function EditorPane({
       >
         {file ? (
           <>
-            <FileIcon name={file.path.slice(file.path.lastIndexOf("/") + 1)} isDirectory={false} />
+            <FileIcon name={baseNameOf(file.path)} isDirectory={false} />
             <span
               className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap font-mono text-[11px]"
               title={file.path}
@@ -123,42 +147,46 @@ export function EditorPane({
             <span className="flex-none text-[10px] tabular-nums" style={{ color: "var(--muted)" }}>
               {formatSize(file.size)}
             </span>
-            <span className="flex-none text-[10px]" style={{ color: "var(--muted)" }}>
-              {dirty ? t("dirty") : saving ? t("saving") : t("saved")}
-            </span>
+            {file.kind === "text" ? (
+              <span className="flex-none text-[10px]" style={{ color: "var(--muted)" }}>
+                {dirty ? t("dirty") : saving ? t("saving") : t("saved")}
+              </span>
+            ) : null}
 
-            {markdown ? (
+            {viewer ? (
               <div
                 role="tablist"
-                aria-label={t("preview")}
+                aria-label={t("viewMode")}
                 className="flex flex-none items-center gap-0.5 rounded-md p-0.5"
                 style={{ background: "var(--surface-hover)" }}
               >
-                {(["edit", "preview"] as const).map((mode) => {
-                  const active = mdMode === mode;
+                {viewer.modes.map((candidate) => {
+                  const active = viewer.mode === candidate;
                   return (
                     <button
-                      key={mode}
+                      key={candidate}
                       type="button"
                       role="tab"
                       aria-selected={active}
-                      onClick={() => onMdMode(mode)}
+                      onClick={() => onViewerMode(candidate)}
                       className="rounded border-0 px-2 py-[3px] text-[11px] transition-colors"
                       style={{
                         background: active ? "var(--accent)" : "transparent",
                         color: active ? "var(--bg)" : "var(--secondary)",
                       }}
                     >
-                      {mode === "edit" ? t("editMode") : t("previewMode")}
+                      {t(MODE_LABEL[candidate])}
                     </button>
                   );
                 })}
               </div>
             ) : null}
 
+            {/* 一直可用：没有文件监听，外部改动只能靠这里拉进来。
+                以前「没有未保存改动」时它是灰的，于是「文件在别处被改了，
+                我想看看新的」正好点不动。有未保存改动时会先弹确认。 */}
             <IconButton
               label={t("reload")}
-              disabled={!dirty && !error}
               onClick={onReload}
               d="M20 11a8 8 0 0 0-14.9-3.9L3 9M3 4v5h5M4 13a8 8 0 0 0 14.9 3.9L21 15M21 20v-5h-5"
             />
@@ -201,6 +229,11 @@ export function EditorPane({
             {t("readOnly")}
           </span>
           <span>{readOnlyReason}</span>
+          {typeof file?.limit === "number" ? (
+            <span style={{ color: "var(--faint)" }}>
+              {t("limitHint", { limit: formatSize(file.limit) })}
+            </span>
+          ) : null}
           {file ? (
             <span className="ml-auto" style={{ color: "var(--faint)" }}>
               {formatTime(file.mtimeMs, locale)}
@@ -212,12 +245,53 @@ export function EditorPane({
       <div className="relative min-h-0 flex-1 overflow-hidden">
         <div ref={hostRef} className="h-full" />
 
-        {previewing && file ? (
+        {structured && file && mode === "markdown" ? (
           <div className="md-scroll">
             <div className="md-body">
-              <MarkdownPreview text={file.text} base={base} onLink={onLink} />
+              <MarkdownPreview text={structuredText} base={base} onLink={onLink} />
             </div>
           </div>
+        ) : null}
+
+        {structured && file && mode === "table" ? (
+          <CsvTable
+            text={structuredText}
+            delimiter={csvDelimiterOf(file.path) ?? ","}
+            pageSize={tablePageSize}
+            onPageSize={onTablePageSize}
+            t={t}
+          />
+        ) : null}
+
+        {structured && file && mode === "tree" ? <JsonTree text={structuredText} t={t} /> : null}
+
+        {file && imageSrc ? (
+          <ImageView key={file.path} src={imageSrc} name={baseNameOf(file.path)} size={file.size} t={t} />
+        ) : null}
+
+        {file && mediaSrc ? (
+          <MediaPlayer
+            key={file.path}
+            src={mediaSrc}
+            mime={file.mime ?? ""}
+            name={baseNameOf(file.path)}
+            size={file.size}
+            t={t}
+          />
+        ) : null}
+
+        {file && sqlite ? (
+          <SqliteView
+            // 带上 loadToken：工具栏的「重新加载」会重新读一次头部，key 一变就重挂载，
+            // schema 与当前页数据跟着刷新（数据库不能被编辑，所以只有这一种变化来源）
+            key={`${file.path}#${file.loadToken}`}
+            path={file.path}
+            info={sqlite.info}
+            available={sqlite.available}
+            pageSize={tablePageSize}
+            onPageSize={onTablePageSize}
+            t={t}
+          />
         ) : null}
 
         {!file ? (

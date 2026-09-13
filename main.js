@@ -20,7 +20,8 @@
  *   ③ 原子写：临时文件 → fsync → chmod → rename，中断不留半写文件
  *   ④ 冲突检测：mtimeMs + size 作为乐观锁，外部改动过的文件不静默覆盖
  *   ⑤ 写入审计：追加到插件数据目录 write-audit.jsonl（宿主审计不到这条路径）
- *   ⑥ 上限：预览 2 MiB / 写入 8 MiB / 单目录 3000 条 / 搜索分页
+ *   ⑥ 上限：文本预览 2 MiB / 图片 8 MiB / 音视频 24 MiB / 写入 8 MiB /
+ *      单目录 3000 条 / 搜索分页（后两类要走 base64，所以单独设限）
  *
  * 通道：视图 window.pluginBridge.invoke("fm.*", payload) → onPanelInvoke。
  *   宿主对自定义通道的转发超时是 30s（plugin-runtime.ts PLUGIN_PANEL_TIMEOUT_MS），
@@ -33,6 +34,8 @@ const path = require("node:path");
 // ── 上限 ────────────────────────────────────────────────────────────────────
 
 const MAX_READ_BYTES = 2 * 1024 * 1024;
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+const MAX_MEDIA_BYTES = 24 * 1024 * 1024;
 const MAX_WRITE_BYTES = 8 * 1024 * 1024;
 const MAX_LIST_ENTRIES = 3000;
 const MAX_SEARCH_MATCHES = 60;
@@ -41,7 +44,44 @@ const SEARCH_BUDGET_MS = 3000;
 const MAX_SEARCH_SESSIONS = 4;
 const AUDIT_MAX_BYTES = 1024 * 1024;
 
-const IMAGE_EXT = /\.(?:png|jpe?g|gif|webp|svg|ico|bmp|avif|tiff?)$/i;
+/**
+ * 图片 / 音视频走 data URI 交给视图：面板是 file:// 的沙箱页，没有文件系统，
+ * 相对路径只会指向视图自身，所以字节必须随响应带过去（base64 会膨胀约 1/3，
+ * 这也是这两类各有独立上限的原因）。
+ *
+ * 只列 Chromium 真能解码的格式。TIFF 故意不在列——浏览器放不出来，硬认成
+ * 图片只会得到一张破图，让它落到二进制分支、明确说「不支持预览」更诚实。
+ * SVG 走 <img>，脚本不会执行（图片上下文是只读渲染，不是文档上下文）。
+ */
+const IMAGE_MIME = new Map([
+  [".png", "image/png"],
+  [".jpg", "image/jpeg"],
+  [".jpeg", "image/jpeg"],
+  [".gif", "image/gif"],
+  [".webp", "image/webp"],
+  [".avif", "image/avif"],
+  [".bmp", "image/bmp"],
+  [".ico", "image/x-icon"],
+  [".svg", "image/svg+xml"],
+]);
+
+const MEDIA_MIME = new Map([
+  [".mp4", "video/mp4"],
+  [".m4v", "video/mp4"],
+  [".mov", "video/quicktime"],
+  [".webm", "video/webm"],
+  [".ogv", "video/ogg"],
+  [".mkv", "video/x-matroska"],
+  [".mp3", "audio/mpeg"],
+  [".m4a", "audio/mp4"],
+  [".aac", "audio/aac"],
+  [".wav", "audio/wav"],
+  [".flac", "audio/flac"],
+  [".ogg", "audio/ogg"],
+  [".oga", "audio/ogg"],
+  [".opus", "audio/opus"],
+  [".weba", "audio/webm"],
+]);
 
 // ── 敏感路径黑名单（读与写都拒绝） ──────────────────────────────────────────
 
@@ -68,8 +108,20 @@ const IGNORE_FILE_NAMES = [".gitignore", ".ignore"];
 
 // ── 模块状态 ────────────────────────────────────────────────────────────────
 
+/**
+ * mdPreview / csvTable / jsonTree 的默认值不同，是刻意的：
+ * CSV 基本是纯数据，打开就想看表格；JSON 多半是 package.json / tsconfig.json
+ * 这类配置，打开就想改文本。两边都只需点一下切换器换到另一侧。
+ */
 let dataPath = null;
-let prefs = { splitRatio: 0.32, showIgnored: false, mdPreview: false };
+let prefs = {
+  splitRatio: 0.32,
+  showIgnored: false,
+  mdPreview: false,
+  csvTable: true,
+  jsonTree: false,
+  tablePageSize: 1000,
+};
 const searchSessions = new Map();
 
 // ── 错误 ────────────────────────────────────────────────────────────────────
@@ -410,6 +462,11 @@ async function handleList(payload) {
   };
 }
 
+/** base64 拼成 data URI——视图只能拿到字符串，不能拿到路径。 */
+function asDataUri(mime, buffer) {
+  return `data:${mime};base64,${buffer.toString("base64")}`;
+}
+
 async function handleRead(payload) {
   const { abs, rel } = await resolveInsideRoot(payload?.path ?? "", { mode: "read" });
 
@@ -418,9 +475,49 @@ async function handleRead(payload) {
   if (stat.isDirectory()) throw fail("INVALID_PATH", "path is a directory");
 
   const base = { path: rel, size: stat.size, mtimeMs: stat.mtimeMs };
+  const extension = path.extname(rel).toLowerCase();
 
-  if (IMAGE_EXT.test(rel)) return { ok: true, kind: "image", ...base };
-  if (stat.size > MAX_READ_BYTES) return { ok: true, kind: "tooLarge", ...base };
+  // 数据库：只读 100 字节的头部就能认出它，所以这一支**不做体积限制**——
+  // 几百 MB 的 .db 也会在这里秒开（真正的取数走 fm.sqlite.*，一次只拿一页）。
+  // 扩展名像但魔数不对的（比如 Windows 的 thumbs.db 其实是 OLE 文件）继续按普通文件走。
+  if (SQLITE_EXT.test(extension)) {
+    const head = await readHead(abs, 100);
+    if (isSqliteFile(head)) {
+      return {
+        ok: true,
+        kind: "sqlite",
+        available: loadSqlite() !== null,
+        info: sqliteInfo(head, stat.size, await exists(`${abs}-wal`), await exists(`${abs}-journal`)),
+        ...base,
+      };
+    }
+  }
+
+  // 图片与音视频返回 data URI：视图在 file:// 下拿不到项目里的文件，
+  // 只能把字节随响应带过去。两类各自先做体积检查，避免读进内存再拒绝。
+  const imageMime = IMAGE_MIME.get(extension);
+  if (imageMime) {
+    if (stat.size > MAX_IMAGE_BYTES) {
+      return { ok: true, kind: "tooLarge", limit: MAX_IMAGE_BYTES, ...base };
+    }
+    const buffer = await fs.readFile(abs);
+    return { ok: true, kind: "image", mime: imageMime, dataUri: asDataUri(imageMime, buffer), ...base };
+  }
+
+  const mediaMime = MEDIA_MIME.get(extension);
+  if (mediaMime) {
+    if (stat.size > MAX_MEDIA_BYTES) {
+      return { ok: true, kind: "tooLarge", limit: MAX_MEDIA_BYTES, ...base };
+    }
+    const buffer = await fs.readFile(abs);
+    return { ok: true, kind: "media", mime: mediaMime, dataUri: asDataUri(mediaMime, buffer), ...base };
+  }
+
+  // 其余扩展名一律按内容判断：超过上限 → tooLarge，含 NUL 字节 → binary。
+  // zip / apk / exe 这类二进制会落到这里，视图只提示「不支持预览」。
+  if (stat.size > MAX_READ_BYTES) {
+    return { ok: true, kind: "tooLarge", limit: MAX_READ_BYTES, ...base };
+  }
 
   const buffer = await fs.readFile(abs);
   if (buffer.subarray(0, 4096).includes(0)) return { ok: true, kind: "binary", ...base };
@@ -722,6 +819,502 @@ async function handleSearch(payload) {
   };
 }
 
+// ── SQLite（只读浏览 + 查询） ───────────────────────────────────────────────
+//
+// 用 Node 内置的 node:sqlite。宿主是 Electron 43 / Node 24，模块存在（实测），
+// 零依赖规则不破——和用 node:fs 同级。
+//
+// 为什么不像图片那样把字节搬给视图：.db 动辄几十上百 MB，只能留在主进程里查，
+// 每次只把一页行发给视图。这是本插件唯一能打开「大文件」的预览类型。
+//
+// 只读是三层钉住的：
+//   ① 打开时 { readOnly: true }
+//   ② 打开后立刻 PRAGMA query_only = 1（实测：DROP / INSERT 都被 SQLite 拒绝，
+//      报 "attempt to write a readonly database"）
+//   ③ 语句白名单：只放行 SELECT / WITH / VALUES / EXPLAIN 与只读 PRAGMA，且必须是
+//      单条语句——node:sqlite 的 prepare 对多语句是**放行**的（实测 "select 1; select 2"
+//      只执行第一条、不报错），所以多语句必须自己拦。
+
+const SQLITE_EXT = /\.(?:db|db3|sqlite|sqlite3)$/i;
+const SQLITE_MAGIC = "SQLite format 3\u0000";
+const SQLITE_MAX_ROWS = 5000;
+const SQLITE_MAX_CELL = 4096;
+const SQLITE_MAX_SQL = 20000;
+const SQLITE_MAX_OFFSET = 100000;
+const SQLITE_HANDLE_LIMIT = 2;
+const SQLITE_IDLE_MS = 60000;
+const ROWID = "rowid";
+
+/** 只放行这些只读 PRAGMA；写性的（journal_mode 带值、writable_schema 等）不进白名单。 */
+const READ_ONLY_PRAGMAS = new Set([
+  "table_info",
+  "table_xinfo",
+  "table_list",
+  "index_list",
+  "index_info",
+  "index_xinfo",
+  "foreign_key_list",
+  "database_list",
+  "page_count",
+  "page_size",
+  "freelist_count",
+  "encoding",
+  "schema_version",
+  "user_version",
+  "compile_options",
+  "collation_list",
+]);
+
+/** 这些词在 SQLite 里都是保留字，只能以关键字出现（列名同名必须加引号，而引号段会被跳过），
+ *  所以扫到就是真的写语句，不会误伤。 */
+const WRITE_VERBS = new Set([
+  "insert",
+  "update",
+  "delete",
+  "replace",
+  "drop",
+  "alter",
+  "create",
+  "attach",
+  "detach",
+  "vacuum",
+  "reindex",
+  "analyze",
+  "begin",
+  "commit",
+  "rollback",
+  "savepoint",
+  "release",
+]);
+
+/**
+ * 拆出语句结构：首个关键字、出现的全部关键字、以及是不是多语句。
+ * 引号段（'…' / "…" / `…` / […]）与注释整段跳过——不然 SQL 里的分号和关键字会把判定带偏。
+ */
+function analyzeSql(sql) {
+  const keywords = [];
+  const length = sql.length;
+  let index = 0;
+  let multiple = false;
+
+  while (index < length) {
+    const char = sql[index];
+
+    if (char === "-" && sql[index + 1] === "-") {
+      while (index < length && sql[index] !== "\n") index += 1;
+      continue;
+    }
+    if (char === "/" && sql[index + 1] === "*") {
+      index += 2;
+      while (index < length && !(sql[index] === "*" && sql[index + 1] === "/")) index += 1;
+      index += 2;
+      continue;
+    }
+    if (char === "'" || char === '"' || char === "`") {
+      const quote = char;
+      index += 1;
+      while (index < length) {
+        if (sql[index] === quote) {
+          if (sql[index + 1] === quote) {
+            index += 2;
+            continue;
+          }
+          index += 1;
+          break;
+        }
+        index += 1;
+      }
+      continue;
+    }
+    if (char === "[") {
+      while (index < length && sql[index] !== "]") index += 1;
+      index += 1;
+      continue;
+    }
+    if (char === ";") {
+      index += 1;
+      // 分号后面还有非空白内容 → 多语句
+      if (sql.slice(index).replace(/[\s;]/g, "").length > 0) multiple = true;
+      continue;
+    }
+    if (/[A-Za-z_]/.test(char)) {
+      let end = index;
+      while (end < length && /[A-Za-z0-9_$]/.test(sql[end])) end += 1;
+      keywords.push(sql.slice(index, end).toLowerCase());
+      index = end;
+      continue;
+    }
+    index += 1;
+  }
+
+  return { head: keywords[0] ?? "", keywords, multiple };
+}
+
+function assertReadOnlySql(sql) {
+  if (!sql.trim()) throw fail("SQLITE_SQL_EMPTY", "the query is empty");
+  if (sql.length > SQLITE_MAX_SQL) throw fail("SQLITE_SQL_TOO_LONG", "the query is too long");
+
+  const { head, keywords, multiple } = analyzeSql(sql);
+  if (multiple) throw fail("SQLITE_SQL_MULTIPLE", "only a single statement is allowed");
+  if (!head) throw fail("SQLITE_SQL_EMPTY", "the query is empty");
+
+  if (head === "select" || head === "values" || head === "explain") return;
+
+  if (head === "with") {
+    // WITH 可以给 INSERT/UPDATE/DELETE 当前缀，得再看一遍整句有没有写动词
+    if (keywords.some((word) => WRITE_VERBS.has(word))) {
+      throw fail("SQLITE_SQL_NOT_READ_ONLY", "only read-only statements are allowed");
+    }
+    return;
+  }
+
+  if (head === "pragma") {
+    const name = keywords[1] ?? "";
+    if (!READ_ONLY_PRAGMAS.has(name)) {
+      throw fail("SQLITE_SQL_NOT_READ_ONLY", `pragma ${name || "?"} is not on the read-only list`);
+    }
+    return;
+  }
+
+  throw fail("SQLITE_SQL_NOT_READ_ONLY", "only select / with / values / explain are allowed");
+}
+
+/** 标识符加引号。名字一律来自我们自己读出的 schema，仍然转义一次——不给自己留例外。 */
+function quoteIdent(name) {
+  return `"${String(name).split('"').join('""')}"`;
+}
+
+let sqliteModule;
+function loadSqlite() {
+  if (sqliteModule !== undefined) return sqliteModule;
+  try {
+    sqliteModule = require("node:sqlite");
+  } catch {
+    sqliteModule = null;
+  }
+  return sqliteModule;
+}
+
+/** rel 路径 → { db, mtimeMs, size, usedAt }；按 mtime + 体积判断句柄是否还新鲜。 */
+const sqliteHandles = new Map();
+
+function closeSqliteHandle(rel) {
+  const entry = sqliteHandles.get(rel);
+  if (!entry) return;
+  sqliteHandles.delete(rel);
+  try {
+    entry.db.close();
+  } catch {
+    /* 关不上就算了，进程退出时会一并释放 */
+  }
+}
+
+function pruneSqliteHandles() {
+  while (sqliteHandles.size > SQLITE_HANDLE_LIMIT) {
+    const oldest = [...sqliteHandles.entries()].sort(
+      (left, right) => left[1].usedAt - right[1].usedAt,
+    )[0];
+    if (!oldest) return;
+    closeSqliteHandle(oldest[0]);
+  }
+}
+
+/** 读文件头（默认 100 字节）——只读这么点，所以 .db 再大也能秒开。 */
+async function readHead(abs, bytes = 100) {
+  let handle = null;
+  try {
+    handle = await fs.open(abs, "r");
+    const buffer = Buffer.alloc(bytes);
+    const { bytesRead } = await handle.read(buffer, 0, bytes, 0);
+    return buffer.subarray(0, bytesRead);
+  } catch {
+    return Buffer.alloc(0);
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+  }
+}
+
+const isSqliteFile = (head) =>
+  head.length >= 16 && head.subarray(0, 16).toString("latin1") === SQLITE_MAGIC;
+
+/** 100 字节头部 → 概览。页大小在偏移 16（大端 u16，值 1 表示 65536）。 */
+function sqliteInfo(head, size, hasWal, hasJournal) {
+  const u16 = (offset) => head.readUInt16BE(offset);
+  const u32 = (offset) => head.readUInt32BE(offset);
+  const encoding = u32(56);
+
+  return {
+    size,
+    pageSize: head.length >= 18 ? (u16(16) === 1 ? 65536 : u16(16)) : 0,
+    pageCount: head.length >= 32 ? u32(28) : 0,
+    encoding: encoding === 2 ? "utf-16le" : encoding === 3 ? "utf-16be" : "utf-8",
+    journalMode: head.length >= 19 && head[18] === 2 ? "wal" : "rollback",
+    schemaVersion: head.length >= 44 ? u32(40) : 0,
+    libraryVersion: head.length >= 100 ? u32(96) : 0,
+    hasWal,
+    hasJournal,
+  };
+}
+
+async function sqliteFileInfo(abs, rel, stat) {
+  const head = await readHead(abs, 100);
+  if (!isSqliteFile(head)) return null;
+  const hasWal = await exists(`${abs}-wal`);
+  const hasJournal = await exists(`${abs}-journal`);
+  return sqliteInfo(head, stat.size, hasWal, hasJournal);
+}
+
+/** 拿到（必要时打开）一个只读句柄。文件在外部被改过就重开，免得看到旧结构。 */
+async function sqliteHandle(relPath) {
+  const { abs, rel } = await resolveInsideRoot(relPath, { mode: "read" });
+
+  const stat = await fs.stat(abs).catch(() => null);
+  if (!stat) throw fail("NOT_FOUND", "file not found");
+  if (stat.isDirectory()) throw fail("INVALID_PATH", "path is a directory");
+
+  const head = await readHead(abs, 100);
+  if (!isSqliteFile(head)) throw fail("NOT_SQLITE", "this file is not a SQLite database");
+
+  const sqlite = loadSqlite();
+  if (!sqlite) throw fail("SQLITE_UNAVAILABLE", "this runtime does not provide node:sqlite");
+
+  // 闲置太久就松手：插件进程不该一直攥着别的程序的数据库文件
+  const now = Date.now();
+  for (const [key, entry] of [...sqliteHandles.entries()]) {
+    if (now - entry.usedAt > SQLITE_IDLE_MS) closeSqliteHandle(key);
+  }
+
+  const cached = sqliteHandles.get(rel);
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+    cached.usedAt = Date.now();
+    return { db: cached.db, rel, abs, stat };
+  }
+  if (cached) closeSqliteHandle(rel);
+
+  const db = new sqlite.DatabaseSync(abs, { readOnly: true });
+  try {
+    db.exec("pragma query_only = 1");
+    // SQLite 是懒打开：文件头合法但内容损坏时，直到第一次查询才报错。
+    // 这里先踹一脚，让失败在 open 阶段就暴露出来。
+    db.prepare("select count(*) as n from sqlite_master").get();
+  } catch (error) {
+    try {
+      db.close();
+    } catch {
+      /* 打不开的句柄只能丢弃 */
+    }
+    if (error?.code === "ERR_SQLITE_ERROR") {
+      throw fail("SQLITE_BROKEN", `SQLite could not read this file: ${error.message}`);
+    }
+    throw error;
+  }
+
+  sqliteHandles.set(rel, { db, mtimeMs: stat.mtimeMs, size: stat.size, usedAt: Date.now() });
+  pruneSqliteHandles();
+  return { db, rel, abs, stat };
+}
+
+function sqliteColumns(db, objectName) {
+  const quoted = quoteIdent(objectName);
+  let info;
+  try {
+    info = db.prepare(`pragma table_info(${quoted})`).all();
+  } catch {
+    return [];
+  }
+  return info.map((row) => ({
+    name: String(row.name ?? ""),
+    type: String(row.type ?? ""),
+    pk: Number(row.pk ?? 0) > 0,
+    notNull: Number(row.notnull ?? 0) > 0,
+  }));
+}
+
+/** 客户端取到的一律是字符串或 null（null 才是 SQL 的 NULL，空字符串是真的空串）。 */
+function formatCell(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string") {
+    return value.length > SQLITE_MAX_CELL ? `${value.slice(0, SQLITE_MAX_CELL)}…` : value;
+  }
+  if (typeof value === "number" || typeof value === "bigint") return String(value);
+  if (value instanceof Uint8Array) return `[blob ${value.length} B]`;
+  return String(value);
+}
+
+/** 用 iterate 只取需要的行——同步 API 没有中断接口，唯一能做的就是把取的行数掐死。 */
+function takeRows(statement, limit) {
+  const rows = [];
+  let truncated = false;
+  for (const row of statement.iterate()) {
+    if (rows.length >= limit) {
+      truncated = true;
+      break;
+    }
+    rows.push(row.map(formatCell));
+  }
+  return { rows, truncated };
+}
+
+function statementColumns(statement) {
+  try {
+    const info = statement.columns() ?? [];
+    return info.map((column) => ({
+      name: String(column.name ?? ""),
+      type: String(column.type ?? ""),
+      pk: false,
+      notNull: false,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+function clampInt(value, min, max, fallback) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.min(Math.max(Math.trunc(number), min), max);
+}
+
+async function handleSqliteOpen(payload) {
+  const { db, rel, abs, stat } = await sqliteHandle(payload?.path ?? "");
+
+  const rows = db
+    .prepare("select type, name, tbl_name, sql from sqlite_master order by type, name")
+    .all();
+
+  const objects = rows.map((row) => ({
+    type: String(row.type ?? ""),
+    name: String(row.name ?? ""),
+    tableName: String(row.tbl_name ?? ""),
+    sql: typeof row.sql === "string" ? row.sql : null,
+  }));
+
+  return {
+    ok: true,
+    path: rel,
+    info: sqliteInfo(
+      await readHead(abs, 100),
+      stat.size,
+      await exists(`${abs}-wal`),
+      await exists(`${abs}-journal`),
+    ),
+    objects,
+  };
+}
+
+async function handleSqliteRows(payload) {
+  const { db, rel } = await sqliteHandle(payload?.path ?? "");
+
+  const requested = typeof payload?.object === "string" ? payload.object : "";
+  const objects = db
+    .prepare("select type, name from sqlite_master where type in ('table','view')")
+    .all();
+  // 对象名绝不直接进 SQL：先在 schema 清单里核对，再拼引号
+  const target = objects.find((row) => String(row.name) === requested);
+  if (!target) throw fail("SQLITE_NO_SUCH_OBJECT", `no such table or view: ${requested}`);
+
+  const name = String(target.name);
+  const columns = sqliteColumns(db, name);
+  const known = new Set(columns.map((column) => column.name));
+
+  let orderBy = typeof payload?.orderBy === "string" ? payload.orderBy : "";
+  if (orderBy && orderBy !== ROWID && !known.has(orderBy)) orderBy = "";
+  const direction = payload?.direction === "desc" ? "DESC" : "ASC";
+
+  const pageSize = clampInt(payload?.pageSize, 1, SQLITE_MAX_ROWS, 1000);
+  const page = clampInt(payload?.page, 1, 1e6, 1);
+  const offset = (page - 1) * pageSize;
+  if (offset > SQLITE_MAX_OFFSET) {
+    throw fail("SQLITE_OFFSET_LIMIT", "this page is beyond the browsing limit");
+  }
+
+  const order = orderBy
+    ? ` ORDER BY (${quoteIdent(orderBy)} IS NULL), ${quoteIdent(orderBy)} ${direction}`
+    : "";
+  const limit = pageSize + 1; // 多取一行，用来判断还有没有下一页
+
+  let statement;
+  let withRowid = true;
+  try {
+    statement = db.prepare(
+      `SELECT ${ROWID}, * FROM ${quoteIdent(name)}${order} LIMIT ${limit} OFFSET ${offset}`,
+    );
+  } catch {
+    // 视图或 WITHOUT ROWID 表没有 rowid，退回普通取数
+    withRowid = false;
+    statement = db.prepare(`SELECT * FROM ${quoteIdent(name)}${order} LIMIT ${limit} OFFSET ${offset}`);
+  }
+  statement.setReturnArrays(true);
+
+  const { rows } = takeRows(statement, limit);
+  const hasMore = rows.length > pageSize;
+
+  let estimate = null;
+  if (String(target.type) === "table") {
+    try {
+      const row = db.prepare(`SELECT max(rowid) AS m FROM ${quoteIdent(name)}`).get();
+      estimate = typeof row?.m === "number" ? row.m : null;
+    } catch {
+      estimate = null;
+    }
+  }
+
+  const resultColumns = withRowid
+    ? [{ name: ROWID, type: "INTEGER", pk: true, notNull: true }, ...columns]
+    : columns;
+
+  return {
+    ok: true,
+    path: rel,
+    object: name,
+    kind: String(target.type),
+    columns: resultColumns,
+    rows: rows.slice(0, pageSize),
+    page,
+    pageSize,
+    hasMore,
+    estimate,
+    hasRowid: withRowid,
+  };
+}
+
+async function handleSqliteQuery(payload) {
+  const { db, rel } = await sqliteHandle(payload?.path ?? "");
+
+  const sql = typeof payload?.sql === "string" ? payload.sql.trim() : "";
+  assertReadOnlySql(sql);
+
+  const limit = clampInt(payload?.limit, 1, SQLITE_MAX_ROWS, 500);
+  const started = Date.now();
+
+  let statement;
+  try {
+    statement = db.prepare(sql);
+  } catch (error) {
+    throw fail("SQLITE_SQL_ERROR", String(error?.message ?? error));
+  }
+
+  statement.setReturnArrays(true);
+  const columns = statementColumns(statement);
+
+  let rows = [];
+  let truncated = false;
+  try {
+    ({ rows, truncated } = takeRows(statement, limit));
+  } catch (error) {
+    throw fail("SQLITE_SQL_ERROR", String(error?.message ?? error));
+  }
+
+  return {
+    ok: true,
+    path: rel,
+    columns,
+    rows,
+    truncated,
+    elapsedMs: Date.now() - started,
+  };
+}
+
 // ── 偏好 ────────────────────────────────────────────────────────────────────
 
 function sanitizePrefs(partial) {
@@ -732,6 +1325,14 @@ function sanitizePrefs(partial) {
     }
     if (typeof partial.showIgnored === "boolean") next.showIgnored = partial.showIgnored;
     if (typeof partial.mdPreview === "boolean") next.mdPreview = partial.mdPreview;
+    if (typeof partial.csvTable === "boolean") next.csvTable = partial.csvTable;
+    if (typeof partial.jsonTree === "boolean") next.jsonTree = partial.jsonTree;
+    // 表格每页行数：夹到 100–5000 并对齐到 100。视图的下拉框只提供几档固定值，
+    // 这里不跟着枚举走（main.js 不该知道视图的选项表），夹紧就够了。
+    if (typeof partial.tablePageSize === "number" && Number.isFinite(partial.tablePageSize)) {
+      const rounded = Math.round(partial.tablePageSize / 100) * 100;
+      next.tablePageSize = Math.min(Math.max(rounded, 100), 5000);
+    }
   }
   return next;
 }
@@ -770,6 +1371,9 @@ const CHANNELS = {
   "fm.rename": handleRename,
   "fm.move": handleMove,
   "fm.search": handleSearch,
+  "fm.sqlite.open": handleSqliteOpen,
+  "fm.sqlite.rows": handleSqliteRows,
+  "fm.sqlite.query": handleSqliteQuery,
 };
 
 async function onPanelInvoke(channel, payload) {
@@ -800,6 +1404,7 @@ async function onLoad() {
 
 async function onUnload() {
   searchSessions.clear();
+  for (const key of [...sqliteHandles.keys()]) closeSqliteHandle(key);
 }
 
 module.exports = { onLoad, onUnload, onPanelInvoke };

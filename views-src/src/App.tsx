@@ -5,9 +5,10 @@ import { watchWorkspace, type Workspace } from "./lib/workspace";
 import { channels, failureMessage, isConflict, type Failure, type FileEntry, type ListResponse, type Prefs, type ReadResponse, type SearchHit, type SearchResponse, type WriteResponse } from "./lib/rpc";
 import { baseNameOf, parentOf } from "./lib/format";
 import { makeT, type T } from "./i18n";
-import { isMarkdown } from "./lib/languages";
+import { resolveViewer, type ViewerMode } from "./lib/viewers";
+import { toOpenFile, withSavedContent, type OpenFile } from "./lib/openFile";
 import { Tree, type DirState } from "./components/Tree";
-import { EditorPane, type MdMode, type OpenFile } from "./components/EditorPane";
+import { EditorPane } from "./components/EditorPane";
 import { ConfirmDialog, PromptDialog } from "./components/Dialogs";
 import { ContextMenu, type MenuEntry } from "./components/ContextMenu";
 import type { EditorHandle } from "./lib/editor";
@@ -45,6 +46,9 @@ export default function App() {
     splitRatio: 0.32,
     showIgnored: false,
     mdPreview: false,
+    csvTable: true,
+    jsonTree: false,
+    tablePageSize: 1000,
   });
   const [ignoreActive, setIgnoreActive] = useState(false);
   const [guard, setGuard] = useState<Guard>(null);
@@ -59,6 +63,16 @@ export default function App() {
   const revisionRef = useRef(0);
   const openTokenRef = useRef(0);
   const searchTokenRef = useRef(0);
+  // 每次「从磁盘装载」递增，写进 OpenFile.loadToken：编辑器据此区分
+  // 「换文件 / 重新加载」与「保存后更新 mtime」。见 lib/openFile.ts。
+  const loadTokenRef = useRef(0);
+  const saveRef = useRef<(override?: { mtimeMs: number; size: number }) => Promise<boolean>>(
+    async () => false,
+  );
+  /** 正在进行的保存（含目标路径）。同一个文件的重复请求复用它，不发出第二次写。 */
+  const inFlightRef = useRef<{ path: string; promise: Promise<boolean> } | null>(null);
+  /** 保存是异步的：回来时用户可能已经切走，元数据与脏标记不能落到新文件上。 */
+  const openPathRef = useRef<string | null>(null);
   const pendingRef = useRef<(() => void) | null>(null);
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const loadRef = useRef<(path: string, force?: boolean) => Promise<void>>(async () => {});
@@ -70,6 +84,7 @@ export default function App() {
 
   dirsRef.current = directories;
   dirtyRef.current = dirty;
+  openPathRef.current = openFile ? openFile.path : null;
   currentNameRef.current = openFile ? baseNameOf(openFile.path) : t("projectFiles");
   tRef.current = t;
 
@@ -206,27 +221,8 @@ export default function App() {
           setError(failureMessage(response, t));
           return;
         }
-        setOpenFile(
-          response.kind === "text"
-            ? {
-                path: response.path,
-                kind: "text",
-                text: response.text,
-                eol: response.eol,
-                bom: response.bom,
-                size: response.size,
-                mtimeMs: response.mtimeMs,
-              }
-            : {
-                path: response.path,
-                kind: response.kind,
-                text: "",
-                eol: "lf",
-                bom: false,
-                size: response.size,
-                mtimeMs: response.mtimeMs,
-              },
-        );
+        loadTokenRef.current += 1;
+        setOpenFile(toOpenFile(response, loadTokenRef.current));
         setDirty(false);
       } catch (cause) {
         if (token !== openTokenRef.current) return;
@@ -264,41 +260,82 @@ export default function App() {
   const save = useCallback(
     async (override?: { mtimeMs: number; size: number }): Promise<boolean> => {
       if (!openFile || openFile.kind !== "text") return false;
-      const text = handleRef.current?.text() ?? openFile.text;
-      setSaving(true);
-      setError(null);
-      try {
-        const response = await invoke<WriteResponse>(channels.write, {
-          path: openFile.path,
-          text,
-          expectedMtimeMs: override?.mtimeMs ?? openFile.mtimeMs,
-          expectedSize: override?.size ?? openFile.size,
-          eol: openFile.eol,
-          bom: openFile.bom,
-        });
-        if (response.ok) {
-          setOpenFile((prev) =>
-            prev ? { ...prev, mtimeMs: response.mtimeMs, size: response.size } : prev,
-          );
-          setDirty(false);
-          void loadDirectory(parentOf(openFile.path), true);
-          return true;
-        }
-        if (isConflict(response)) {
-          setConflict({ mtimeMs: response.mtimeMs, size: response.size });
+      // 没有改动就不写盘：Ctrl+S 是习惯动作，不该白抬一次 mtime、白记一行审计，
+      // 更不该因为文件在别处被改过而弹出一个「冲突」。带 override 的是冲突框里的
+      // 「覆盖」，那是显式意图，照写。
+      if (!override && !dirtyRef.current) return false;
+      // 同一个文件上一次保存还没回来：复用那次结果。连按两下 Ctrl+S 不会发出
+      // 第二次写，也就不会用同一个 mtime 期望值把自己撞成 CONFLICT。
+      if (inFlightRef.current?.path === openFile.path) return inFlightRef.current.promise;
+
+      const target = openFile;
+      const text = handleRef.current?.text() ?? target.text;
+
+      const run = (async (): Promise<boolean> => {
+        setSaving(true);
+        setError(null);
+        try {
+          const response = await invoke<WriteResponse>(channels.write, {
+            path: target.path,
+            text,
+            expectedMtimeMs: override?.mtimeMs ?? target.mtimeMs,
+            expectedSize: override?.size ?? target.size,
+            eol: target.eol,
+            bom: target.bom,
+          });
+
+          // 写是成功了，但用户可能已经切走——那就只认这次写的成功，别把
+          // 元数据、脏标记、冲突框落到另一个文件上。
+          if (openPathRef.current !== target.path) return response.ok;
+
+          if (response.ok) {
+            // 只更新元数据（下一次乐观锁的期望值）与文本，loadToken 不动：
+            // 编辑器里的文档就是刚存下去的那份，不该被重装。
+            setOpenFile((prev) => (prev ? withSavedContent(prev, response, text) : prev));
+            setDirty(false);
+            void loadDirectory(parentOf(target.path), true);
+            return true;
+          }
+          if (isConflict(response)) {
+            setConflict({ mtimeMs: response.mtimeMs, size: response.size });
+            return false;
+          }
+          setError(failureMessage(response, t));
           return false;
+        } catch (cause) {
+          if (openPathRef.current === target.path) setError(String((cause as Error).message));
+          return false;
+        } finally {
+          setSaving(false);
         }
-        setError(failureMessage(response, t));
-        return false;
-      } catch (cause) {
-        setError(String((cause as Error).message));
-        return false;
+      })();
+
+      inFlightRef.current = { path: target.path, promise: run };
+      try {
+        return await run;
       } finally {
-        setSaving(false);
+        if (inFlightRef.current?.promise === run) inFlightRef.current = null;
       }
     },
     [loadDirectory, openFile, t],
   );
+
+  saveRef.current = save;
+
+  // Ctrl/Cmd+S 在编辑器之外也得能用：点了工具栏按钮、或正停在预览 / 表格 / 树
+  // 视图时，焦点不在 CodeMirror 里，编辑器自己的键位收不到这个键。编辑器内部的
+  // 绑定保留——它先跑并 preventDefault，这里据此跳过，不会保存两次。
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key.toLowerCase() !== "s" || event.altKey || event.shiftKey) return;
+      if (!event.ctrlKey && !event.metaKey) return;
+      if (event.defaultPrevented) return;
+      event.preventDefault();
+      void saveRef.current();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
 
   const reloadFromDisk = useCallback(() => {
     if (!openFile) return;
@@ -451,8 +488,16 @@ export default function App() {
     [],
   );
 
-  const markdown = Boolean(openFile && openFile.kind === "text" && isMarkdown(openFile.path));
-  const mdMode: MdMode = markdown && prefs.mdPreview ? "preview" : "edit";
+  // 结构化视图（Markdown 预览 / 表格 / 树）只对文本文件成立；具体有哪几种、
+  // 默认落在哪一侧，全部由 lib/viewers.ts 一处判定，偏好决定默认值。
+  const viewer = openFile && openFile.kind === "text" ? resolveViewer(openFile.path, prefs) : null;
+
+  const changeViewerMode = (mode: ViewerMode) => {
+    if (!viewer) return;
+    if (viewer.modes.includes("markdown")) persistPrefs({ mdPreview: mode === "markdown" });
+    else if (viewer.modes.includes("table")) persistPrefs({ csvTable: mode === "table" });
+    else if (viewer.modes.includes("tree")) persistPrefs({ jsonTree: mode === "tree" });
+  };
 
   const menuEntries = (): MenuEntry[] => {
     const target = menu?.entry ?? null;
@@ -692,13 +737,15 @@ export default function App() {
           dirty={dirty}
           saving={saving}
           error={error}
-          mdMode={mdMode}
+          viewer={viewer}
+          tablePageSize={prefs.tablePageSize}
           t={t}
           handleRef={handleRef}
           onDirty={() => setDirty(true)}
           onSave={() => void save()}
           onReload={reloadFromDisk}
-          onMdMode={(mode) => persistPrefs({ mdPreview: mode === "preview" })}
+          onViewerMode={changeViewerMode}
+          onTablePageSize={(size) => persistPrefs({ tablePageSize: size })}
           onLink={onLink}
         />
       </div>

@@ -76,6 +76,19 @@ const GLYPH: Record<string, ReactNode> = {
       <path d="m4 17 5-5 4 4 3-3 4 4" />
     </>
   ),
+  video: (
+    <>
+      <rect x="2.5" y="5" width="19" height="14" rx="2" />
+      <path d="m10 9.5 5 2.5-5 2.5z" />
+    </>
+  ),
+  audio: (
+    <>
+      <path d="M9 18V6l10-2v12" />
+      <circle cx="6.5" cy="18" r="2.5" />
+      <circle cx="16.5" cy="16" r="2.5" />
+    </>
+  ),
   archive: (
     <>
       <rect x="3" y="4" width="18" height="4" rx="1" />
@@ -140,6 +153,7 @@ const C = {
   doc: "var(--icon-doc)",
   shell: "#4e9a06",
   image: "#26a269",
+  media: "#c678dd",
   archive: "#a8823c",
   font: "#8e7cc3",
   lock: "#c0703c",
@@ -258,6 +272,22 @@ const BY_EXT: Record<string, Spec> = {
   bmp: { glyph: "image", color: C.image },
   avif: { glyph: "image", color: C.image },
   tiff: { glyph: "image", color: C.image },
+  mp4: { glyph: "video", color: C.media },
+  m4v: { glyph: "video", color: C.media },
+  mov: { glyph: "video", color: C.media },
+  webm: { glyph: "video", color: C.media },
+  mkv: { glyph: "video", color: C.media },
+  ogv: { glyph: "video", color: C.media },
+  avi: { glyph: "video", color: C.media },
+  mp3: { glyph: "audio", color: C.media },
+  m4a: { glyph: "audio", color: C.media },
+  aac: { glyph: "audio", color: C.media },
+  wav: { glyph: "audio", color: C.media },
+  flac: { glyph: "audio", color: C.media },
+  ogg: { glyph: "audio", color: C.media },
+  oga: { glyph: "audio", color: C.media },
+  opus: { glyph: "audio", color: C.media },
+  weba: { glyph: "audio", color: C.media },
   zip: { glyph: "archive", color: C.archive },
   gz: { glyph: "archive", color: C.archive },
   tar: { glyph: "archive", color: C.archive },

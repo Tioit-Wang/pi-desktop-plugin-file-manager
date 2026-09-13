@@ -27,6 +27,12 @@ export type Prefs = {
   showIgnored: boolean;
   /** Markdown 默认打开为预览还是编辑；只对 .md/.markdown/.mdx 生效。 */
   mdPreview: boolean;
+  /** CSV/TSV 默认打开为表格还是源码。 */
+  csvTable: boolean;
+  /** JSON 默认打开为折叠树还是源码。 */
+  jsonTree: boolean;
+  /** 表格每页行数（100–5000，100 的整数倍；默认 1000）。 */
+  tablePageSize: number;
 };
 
 export type Limits = {
@@ -63,15 +69,125 @@ export type TextRead = {
   mtimeMs: number;
 };
 
-export type OpaqueRead = {
+/**
+ * 图片与音视频把字节以 data URI 带过来——面板是 file:// 的沙箱页，
+ * 没有文件系统，相对路径只会指回视图自己。
+ */
+export type DataRead = {
   ok: true;
-  kind: "binary" | "image" | "tooLarge";
+  kind: "image" | "media";
+  path: string;
+  size: number;
+  mtimeMs: number;
+  /** image/png、video/mp4 这类；视图据此选 <img> 还是 <video>/<audio>。 */
+  mime: string;
+  dataUri: string;
+};
+
+/** 超过该类型的体积上限；limit 是具体的字节数，UI 直接显示给用户。 */
+export type TooLargeRead = {
+  ok: true;
+  kind: "tooLarge";
+  path: string;
+  size: number;
+  mtimeMs: number;
+  limit: number;
+};
+
+/** zip / apk / exe 这类没有可预览形态的文件。 */
+export type BinaryRead = {
+  ok: true;
+  kind: "binary";
   path: string;
   size: number;
   mtimeMs: number;
 };
 
-export type ReadResponse = TextRead | OpaqueRead;
+/** 数据库头部读出来的概览（不含内容——真正的取数走 fm.sqlite.*，一次一页）。 */
+export type SqliteInfo = {
+  size: number;
+  pageSize: number;
+  pageCount: number;
+  encoding: "utf-8" | "utf-16le" | "utf-16be";
+  journalMode: "wal" | "rollback";
+  schemaVersion: number;
+  libraryVersion: number;
+  /** 旁边有 -wal 文件：可能有还没合并回去的改动，显示的内容未必是最新。 */
+  hasWal: boolean;
+  hasJournal: boolean;
+};
+
+export type SqliteObject = {
+  /** table | view | index | trigger */
+  type: string;
+  name: string;
+  tableName: string;
+  sql: string | null;
+};
+
+export type SqliteColumn = {
+  name: string;
+  type: string;
+  pk: boolean;
+  notNull: boolean;
+};
+
+/** SQLite 文件：只带头部信息，字节留在主进程里。 */
+export type SqliteRead = {
+  ok: true;
+  kind: "sqlite";
+  path: string;
+  size: number;
+  mtimeMs: number;
+  /** 宿主运行时有没有 node:sqlite；没有就只能看概览。 */
+  available: boolean;
+  info: SqliteInfo;
+};
+
+export type ReadResponse = TextRead | DataRead | TooLargeRead | BinaryRead | SqliteRead;
+
+export type SqliteOpenResponse = {
+  ok: true;
+  path: string;
+  info: SqliteInfo;
+  objects: SqliteObject[];
+};
+
+export type SqliteRowsResponse = {
+  ok: true;
+  path: string;
+  object: string;
+  kind: "table" | "view";
+  columns: SqliteColumn[];
+  /** 单元格一律是字符串或 null（null 才是 SQL 的 NULL）。 */
+  rows: (string | null)[][];
+  page: number;
+  pageSize: number;
+  hasMore: boolean;
+  /** max(rowid) 的估算，不是精确行数（精确 COUNT(*) 在大表上是全表扫描）。 */
+  estimate: number | null;
+  hasRowid: boolean;
+};
+
+export type SqliteQueryResponse = {
+  ok: true;
+  path: string;
+  columns: SqliteColumn[];
+  rows: (string | null)[][];
+  truncated: boolean;
+  elapsedMs: number;
+};
+
+export type SqliteRowsRequest = {
+  path: string;
+  object: string;
+  page: number;
+  pageSize: number;
+  orderBy?: string;
+  direction?: "asc" | "desc";
+};
+
+export type SqliteQueryRequest = { path: string; sql: string; limit: number };
 
 export type WriteOk = { ok: true; mtimeMs: number; size: number };
 
@@ -124,6 +240,9 @@ export const channels = {
   rename: "fm.rename",
   move: "fm.move",
   search: "fm.search",
+  sqliteOpen: "fm.sqlite.open",
+  sqliteRows: "fm.sqlite.rows",
+  sqliteQuery: "fm.sqlite.query",
 } as const;
 
 /** 把失败响应统一成人话，供 UI 直接展示。 */
@@ -149,7 +268,26 @@ export function failureMessage(failure: Failure, t: T): string {
       return t("errNotFound");
     case "UNSUPPORTED":
       return t("errUnsupported");
+    case "NOT_SQLITE":
+      return t("sqliteNotADatabase");
+    case "SQLITE_UNAVAILABLE":
+      return t("sqliteUnavailable");
+    case "SQLITE_BROKEN":
+      return t("sqliteBroken");
+    case "SQLITE_SQL_EMPTY":
+      return t("sqliteSqlEmpty");
+    case "SQLITE_SQL_TOO_LONG":
+      return t("sqliteSqlTooLong");
+    case "SQLITE_SQL_MULTIPLE":
+      return t("sqliteSqlMultiple");
+    case "SQLITE_SQL_NOT_READ_ONLY":
+      return t("sqliteSqlReadOnly");
+    case "SQLITE_NO_SUCH_OBJECT":
+      return t("sqliteNoSuchObject");
+    case "SQLITE_OFFSET_LIMIT":
+      return t("sqliteOffsetLimit");
     default:
+      // SQLITE_SQL_ERROR 走这里：引擎自己的报错（no such table: …）就是最有用的文案
       return failure.message || failure.code;
   }
 }
