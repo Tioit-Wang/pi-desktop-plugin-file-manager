@@ -20,12 +20,19 @@ export function formatTime(ms?: number, locale = "en"): string {
   }
 }
 
+/**
+ * 视图里的路径有两种形态：项目内的 POSIX 相对路径，以及宿主请求打开的
+ * 项目外绝对路径（Windows 下用 `\`）。父子拆分要同时认两种分隔符。
+ */
+const lastSeparator = (path: string): number =>
+  Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+
 export const parentOf = (path: string): string => {
-  const index = path.lastIndexOf("/");
+  const index = lastSeparator(path);
   return index === -1 ? "" : path.slice(0, index);
 };
 
-export const baseNameOf = (path: string): string => path.slice(path.lastIndexOf("/") + 1);
+export const baseNameOf = (path: string): string => path.slice(lastSeparator(path) + 1);
 
 export const childPath = (parent: string, name: string): string =>
   parent ? `${parent}/${name}` : name;

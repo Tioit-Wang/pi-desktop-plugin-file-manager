@@ -24,6 +24,11 @@ export type Failure = { ok: false; code: string; message: string };
 
 export type Prefs = {
   splitRatio: number;
+  /**
+   * 左侧文件列表是否收起。宿主请求打开文件时会强制收起，并随设置持久化；
+   * splitRatio 照旧保留，重新展开时按原宽度恢复。
+   */
+  treeCollapsed: boolean;
   showIgnored: boolean;
   /** Markdown 默认打开为预览还是编辑；只对 .md/.markdown/.mdx 生效。 */
   mdPreview: boolean;
@@ -215,6 +220,15 @@ export type SearchResponse = {
 
 export type PrefsResponse = { ok: true; prefs: Prefs } | Failure;
 
+export type ReadRequest = {
+  path: string;
+  /**
+   * 宿主请求打开的项目之外绝对路径（会话临时目录 / 附件）：显式声明后主进程
+   * 只查黑名单与 realpath，不再要求路径落在项目根内。
+   */
+  external?: boolean;
+};
+
 export type WriteRequest = {
   path: string;
   text: string;
@@ -222,6 +236,8 @@ export type WriteRequest = {
   expectedSize: number;
   eol: "lf" | "crlf";
   bom: boolean;
+  /** 同 ReadRequest.external：项目之外的绝对路径，主进程按外部路径解析。 */
+  external?: boolean;
 };
 
 /** CONFLICT 是带当前磁盘状态的失败，需要 discriminated 检查而不是比 code。 */

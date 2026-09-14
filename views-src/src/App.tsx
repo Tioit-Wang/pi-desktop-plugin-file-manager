@@ -2,12 +2,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "./lib/bridge";
 import { watchAppearance, type Base, type Locale as HostLocale } from "./lib/appearance";
 import { watchWorkspace, type Workspace } from "./lib/workspace";
-import { channels, failureMessage, isConflict, type Failure, type FileEntry, type ListResponse, type Prefs, type ReadResponse, type SearchHit, type SearchResponse, type WriteResponse } from "./lib/rpc";
+import { channels, failureMessage, isConflict, type Failure, type FileEntry, type ListResponse, type Prefs, type ReadRequest, type ReadResponse, type SearchHit, type SearchResponse, type WriteRequest, type WriteResponse } from "./lib/rpc";
 import { baseNameOf, parentOf } from "./lib/format";
 import { makeT, type T } from "./i18n";
 import { resolveViewer, type ViewerMode } from "./lib/viewers";
 import { toOpenFile, withSavedContent, type OpenFile } from "./lib/openFile";
 import { openWithDefaultApp, revealInFileManager } from "./lib/hostActions";
+import { isExternalPath, watchHostOpenRequests, type HostOpenRequest } from "./lib/hostOpen";
 import { Tree, type DirState } from "./components/Tree";
 import { EditorPane } from "./components/EditorPane";
 import { ConfirmDialog, PromptDialog } from "./components/Dialogs";
@@ -45,6 +46,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [prefs, setPrefs] = useState<Prefs>({
     splitRatio: 0.32,
+    treeCollapsed: false,
     showIgnored: false,
     mdPreview: false,
     csvTable: true,
@@ -77,6 +79,8 @@ export default function App() {
   const pendingRef = useRef<(() => void) | null>(null);
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const loadRef = useRef<(path: string, force?: boolean) => Promise<void>>(async () => {});
+  /** 宿主请求（入口查询串 / view:open 推送）统一走它。 */
+  const hostOpenRef = useRef<(request: HostOpenRequest) => void>(() => {});
 
   // 让回调读到最新值而不必重订阅。
   const dirtyRef = useRef(dirty);
@@ -148,6 +152,13 @@ export default function App() {
     })();
   }, []);
 
+  // ── 宿主要求打开某个文件 ─────────────────────────────────────────────────
+  //
+  // 两条投递路径的去重与优先级都在 lib/hostOpen.ts 里；这里只订阅一次，回调经
+  // ref 取最新实现——把 t / loadDirectory 放进依赖会让切换语言时重订阅，把
+  // 同一条请求再放一遍。
+  useEffect(() => watchHostOpenRequests((request) => hostOpenRef.current(request)), []);
+
   // ── 目录操作 ─────────────────────────────────────────────────────────────
 
   const loadDirectory = useCallback(
@@ -210,13 +221,22 @@ export default function App() {
 
   // ── 打开 / 保存 ──────────────────────────────────────────────────────────
 
+  /**
+   * 打开一个路径。只要 path：宿主请求打开的可能是项目之外的绝对路径（会话
+   * 临时目录 / 附件），它没有对应的树条目。
+   */
   const openEntry = useCallback(
-    async (entry: FileEntry) => {
+    async (entry: { path: string }) => {
       const token = ++openTokenRef.current;
-      setSelected(entry.path);
+      // 项目外路径不在树里：选中态置空，免得高亮到一条无关的行。
+      const external = isExternalPath(entry.path);
+      setSelected(external ? null : entry.path);
       setError(null);
       try {
-        const response = await invoke<ReadResponse | Failure>(channels.read, { path: entry.path });
+        const request: ReadRequest = external
+          ? { path: entry.path, external: true }
+          : { path: entry.path };
+        const response = await invoke<ReadResponse | Failure>(channels.read, request);
         if (token !== openTokenRef.current) return;
         if (!response.ok) {
           setError(failureMessage(response, t));
@@ -258,6 +278,46 @@ export default function App() {
     void invoke(channels.prefsSet, { partial }).catch(() => {});
   }, []);
 
+  /**
+   * 宿主要求打开的文件：两条投递路径（入口查询串 / view:open 推送）最终都落到
+   * 这里。视觉结果与在树里点这个文件一致，因此复用 openEntry 与它的脏缓冲守
+   * 卫；项目外的绝对路径不在树里，既不展开也不高亮（选中态在 openEntry 里被
+   * 置空）。宿主请求一律把左侧列表收起并持久化，用户之后重新展开会一直保持到
+   * 下一次宿主请求。
+   */
+  const applyHostOpen = useCallback(
+    (request: HostOpenRequest) => {
+      const path = request.path;
+      persistPrefs({ treeCollapsed: true });
+
+      // 已经是这个文件：不重装文档，也就不必为脏缓冲再问一遍。
+      if (path === openPathRef.current) return;
+
+      if (isExternalPath(path)) {
+        withGuard(() => void openEntry({ path }));
+        return;
+      }
+
+      // 项目内路径：展开并加载祖先目录，与搜索命中的跳转是同一套做法。
+      const segments = path.split("/");
+      const parents: string[] = [];
+      for (let index = 1; index < segments.length; index += 1) {
+        parents.push(segments.slice(0, index).join("/"));
+      }
+      withGuard(() => {
+        setSelected(path);
+        setExpanded((prev) => new Set([...prev, ...parents]));
+        void (async () => {
+          for (const parent of parents) await loadDirectory(parent);
+          await openEntry({ path });
+        })();
+      });
+    },
+    [loadDirectory, openEntry, persistPrefs, withGuard],
+  );
+
+  hostOpenRef.current = applyHostOpen;
+
   const save = useCallback(
     async (override?: { mtimeMs: number; size: number }): Promise<boolean> => {
       if (!openFile || openFile.kind !== "text") return false;
@@ -276,14 +336,19 @@ export default function App() {
         setSaving(true);
         setError(null);
         try {
-          const response = await invoke<WriteResponse>(channels.write, {
+          const external = isExternalPath(target.path);
+          const request: WriteRequest = {
             path: target.path,
             text,
             expectedMtimeMs: override?.mtimeMs ?? target.mtimeMs,
             expectedSize: override?.size ?? target.size,
             eol: target.eol,
             bom: target.bom,
-          });
+            // 宿主请求打开的项目外文件：显式声明，主进程只查黑名单，不再要求
+            // 路径落在项目根内。
+            ...(external ? { external: true } : {}),
+          };
+          const response = await invoke<WriteResponse>(channels.write, request);
 
           // 写是成功了，但用户可能已经切走——那就只认这次写的成功，别把
           // 元数据、脏标记、冲突框落到另一个文件上。
@@ -294,7 +359,8 @@ export default function App() {
             // 编辑器里的文档就是刚存下去的那份，不该被重装。
             setOpenFile((prev) => (prev ? withSavedContent(prev, response, text) : prev));
             setDirty(false);
-            void loadDirectory(parentOf(target.path), true);
+            // 项目外的文件没有对应的树目录要刷新。
+            if (!external) void loadDirectory(parentOf(target.path), true);
             return true;
           }
           if (isConflict(response)) {
@@ -597,6 +663,15 @@ export default function App() {
         </span>
 
         <span className="ml-auto flex flex-none items-center gap-1">
+          <IconButton
+            label={prefs.treeCollapsed ? t("showTree") : t("hideTree")}
+            active={!prefs.treeCollapsed}
+            onClick={() => persistPrefs({ treeCollapsed: !prefs.treeCollapsed })}
+          >
+            <rect x="3" y="3" width="18" height="18" rx="2" />
+            <path d="M9 3v18" />
+            {prefs.treeCollapsed ? <path d="m13 9 3 3-3 3" /> : <path d="m16 9-3 3 3 3" />}
+          </IconButton>
           <IconButton label={t("newFile")} onClick={() => setPrompt({ kind: "newFile", parent: selectedDirPath() })}>
             <path d="M14 3v4a1 1 0 0 0 1 1h4" />
             <path d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2z" />
@@ -632,134 +707,138 @@ export default function App() {
       </header>
 
       <div ref={bodyRef} className="flex min-h-0 flex-1">
-        <aside
-          className="flex min-h-0 min-w-0 flex-col"
-          style={{ width: `${prefs.splitRatio * 100}%`, background: "var(--surface)" }}
-        >
-          <div className="flex flex-none items-center gap-1.5 px-2.5 pb-1.5 pt-2">
-            <div className="relative flex min-w-0 flex-1 items-center">
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" style={{ color: "var(--faint)", position: "absolute", left: 7 }} aria-hidden="true">
-                <circle cx="11" cy="11" r="7" />
-                <path d="m20 20-3.5-3.5" />
-              </svg>
-              <input
-                value={query}
-                onChange={(event) => setQuery(event.target.value)}
-                placeholder={t("searchPlaceholder")}
-                aria-label={t("search")}
-                className="w-full rounded-md border py-1 pl-6 pr-6 text-[11.5px] outline-none"
-                style={{ borderColor: "var(--border-strong)", background: "var(--bg)", color: "var(--fg)" }}
-              />
-              {query ? (
-                <button
-                  type="button"
-                  aria-label={t("clear")}
-                  onClick={() => setQuery("")}
-                  className="absolute right-1 inline-flex h-5 w-5 items-center justify-center rounded border-0 bg-transparent"
-                  style={{ color: "var(--faint)" }}
-                >
-                  ×
-                </button>
-              ) : null}
-            </div>
-            <IconButton label={t("refresh")} small onClick={refreshSelectedDirectory}>
-              <path d="M20 11a8 8 0 0 0-14.9-3.9L3 9" />
-              <path d="M3 4v5h5" />
-              <path d="M4 13a8 8 0 0 0 14.9 3.9L21 15" />
-              <path d="M21 20v-5h-5" />
-            </IconButton>
-          </div>
-
-          <div className="flex flex-none items-center justify-between gap-2 px-3 pb-1 text-[10.5px] font-medium uppercase tracking-wider" style={{ color: "var(--muted)" }}>
-            <span>{searchActive ? t("search") : t("treeSection")}</span>
-            <span className="tabular-nums" style={{ color: "var(--faint)" }}>
-              {searchActive
-                ? search.running
-                  ? t("searchScanning")
-                  : String(search.hits.length)
-                : ""}
-            </span>
-          </div>
-
-          {searchActive ? (
-            <div className="min-h-0 flex-1 overflow-auto px-1.5 pb-4" role="listbox" aria-label={t("search")}>
-              {search.hits.length === 0 && !search.running ? (
-                <div className="px-3 py-2 text-[11.5px]" style={{ color: "var(--muted)" }}>
-                  {t("searchEmpty")}
+        {prefs.treeCollapsed ? null : (
+          <>
+            <aside
+              className="flex min-h-0 min-w-0 flex-col"
+              style={{ width: `${prefs.splitRatio * 100}%`, background: "var(--surface)" }}
+            >
+              <div className="flex flex-none items-center gap-1.5 px-2.5 pb-1.5 pt-2">
+                <div className="relative flex min-w-0 flex-1 items-center">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" style={{ color: "var(--faint)", position: "absolute", left: 7 }} aria-hidden="true">
+                    <circle cx="11" cy="11" r="7" />
+                    <path d="m20 20-3.5-3.5" />
+                  </svg>
+                  <input
+                    value={query}
+                    onChange={(event) => setQuery(event.target.value)}
+                    placeholder={t("searchPlaceholder")}
+                    aria-label={t("search")}
+                    className="w-full rounded-md border py-1 pl-6 pr-6 text-[11.5px] outline-none"
+                    style={{ borderColor: "var(--border-strong)", background: "var(--bg)", color: "var(--fg)" }}
+                  />
+                  {query ? (
+                    <button
+                      type="button"
+                      aria-label={t("clear")}
+                      onClick={() => setQuery("")}
+                      className="absolute right-1 inline-flex h-5 w-5 items-center justify-center rounded border-0 bg-transparent"
+                      style={{ color: "var(--faint)" }}
+                    >
+                      ×
+                    </button>
+                  ) : null}
                 </div>
-              ) : null}
-              {search.hits.map((hit) => (
-                <button
-                  key={hit.path}
-                  type="button"
-                  role="option"
-                  aria-selected={selected === hit.path}
-                  title={hit.path}
-                  onClick={() => {
-                    const path = hit.path;
-                    withGuard(() => {
-                      setQuery("");
-                      const segments = path.split("/");
-                      const parents: string[] = [];
-                      for (let index = 1; index < segments.length; index += 1) {
-                        parents.push(segments.slice(0, index).join("/"));
-                      }
-                      setExpanded((prev) => new Set([...prev, ...parents]));
-                      if (hit.isDirectory) {
-                        void loadDirectory(path, true).then(() => setSelected(path));
-                        void (async () => {
-                          for (const parent of parents) await loadDirectory(parent);
-                        })();
-                      } else {
-                        setSelected(path);
-                        void (async () => {
-                          for (const parent of parents) await loadDirectory(parent);
-                          await openEntry({ path, name: hit.name, isDirectory: false } as FileEntry);
-                        })();
-                      }
-                    });
-                  }}
-                  className="flex w-full cursor-pointer items-center gap-1.5 rounded-md border-0 px-2 py-[3px] text-left text-[12px] transition-colors hover:bg-[var(--surface-hover)] hover:text-[var(--fg)]"
-                  style={{ color: "var(--secondary)", minHeight: 24 }}
-                >
-                  <span className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap">
-                    {hit.name}
-                  </span>
-                  <span className="flex-none overflow-hidden text-ellipsis whitespace-nowrap text-[10px]" style={{ color: "var(--faint)", maxWidth: "45%" }} dir="rtl">
-                    {parentOf(hit.path)}
-                  </span>
-                </button>
-              ))}
-            </div>
-          ) : (
-            <Tree
-              directories={directories}
-              expanded={expanded}
-              selected={selected}
-              showIgnored={prefs.showIgnored}
-              t={t}
-              onToggle={toggleDirectory}
-              onOpen={requestOpen}
-              onRefreshDir={(path) => void loadDirectory(path, true)}
-              onContextMenu={openMenu}
+                <IconButton label={t("refresh")} small onClick={refreshSelectedDirectory}>
+                  <path d="M20 11a8 8 0 0 0-14.9-3.9L3 9" />
+                  <path d="M3 4v5h5" />
+                  <path d="M4 13a8 8 0 0 0 14.9 3.9L21 15" />
+                  <path d="M21 20v-5h-5" />
+                </IconButton>
+              </div>
+
+              <div className="flex flex-none items-center justify-between gap-2 px-3 pb-1 text-[10.5px] font-medium uppercase tracking-wider" style={{ color: "var(--muted)" }}>
+                <span>{searchActive ? t("search") : t("treeSection")}</span>
+                <span className="tabular-nums" style={{ color: "var(--faint)" }}>
+                  {searchActive
+                    ? search.running
+                      ? t("searchScanning")
+                      : String(search.hits.length)
+                    : ""}
+                </span>
+              </div>
+
+              {searchActive ? (
+                <div className="min-h-0 flex-1 overflow-auto px-1.5 pb-4" role="listbox" aria-label={t("search")}>
+                  {search.hits.length === 0 && !search.running ? (
+                    <div className="px-3 py-2 text-[11.5px]" style={{ color: "var(--muted)" }}>
+                      {t("searchEmpty")}
+                    </div>
+                  ) : null}
+                  {search.hits.map((hit) => (
+                    <button
+                      key={hit.path}
+                      type="button"
+                      role="option"
+                      aria-selected={selected === hit.path}
+                      title={hit.path}
+                      onClick={() => {
+                        const path = hit.path;
+                        withGuard(() => {
+                          setQuery("");
+                          const segments = path.split("/");
+                          const parents: string[] = [];
+                          for (let index = 1; index < segments.length; index += 1) {
+                            parents.push(segments.slice(0, index).join("/"));
+                          }
+                          setExpanded((prev) => new Set([...prev, ...parents]));
+                          if (hit.isDirectory) {
+                            void loadDirectory(path, true).then(() => setSelected(path));
+                            void (async () => {
+                              for (const parent of parents) await loadDirectory(parent);
+                            })();
+                          } else {
+                            setSelected(path);
+                            void (async () => {
+                              for (const parent of parents) await loadDirectory(parent);
+                              await openEntry({ path, name: hit.name, isDirectory: false } as FileEntry);
+                            })();
+                          }
+                        });
+                      }}
+                      className="flex w-full cursor-pointer items-center gap-1.5 rounded-md border-0 px-2 py-[3px] text-left text-[12px] transition-colors hover:bg-[var(--surface-hover)] hover:text-[var(--fg)]"
+                      style={{ color: "var(--secondary)", minHeight: 24 }}
+                    >
+                      <span className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap">
+                        {hit.name}
+                      </span>
+                      <span className="flex-none overflow-hidden text-ellipsis whitespace-nowrap text-[10px]" style={{ color: "var(--faint)", maxWidth: "45%" }} dir="rtl">
+                        {parentOf(hit.path)}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <Tree
+                  directories={directories}
+                  expanded={expanded}
+                  selected={selected}
+                  showIgnored={prefs.showIgnored}
+                  t={t}
+                  onToggle={toggleDirectory}
+                  onOpen={requestOpen}
+                  onRefreshDir={(path) => void loadDirectory(path, true)}
+                  onContextMenu={openMenu}
+                />
+              )}
+
+              {prefs.showIgnored || !ignoreActive ? null : (
+                <div className="flex-none px-3 pb-2 text-[10.5px]" style={{ color: "var(--faint)" }}>
+                  {t("ignoredHidden")}
+                </div>
+              )}
+            </aside>
+
+            <div
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="Resize"
+              onMouseDown={startResize}
+              className="w-[3px] flex-none cursor-col-resize transition-colors hover:bg-[var(--surface-hover)]"
+              style={{ background: "var(--border)" }}
             />
-          )}
-
-          {prefs.showIgnored || !ignoreActive ? null : (
-            <div className="flex-none px-3 pb-2 text-[10.5px]" style={{ color: "var(--faint)" }}>
-              {t("ignoredHidden")}
-            </div>
-          )}
-        </aside>
-
-        <div
-          role="separator"
-          aria-orientation="vertical"
-          aria-label="Resize"
-          onMouseDown={startResize}
-          className="w-[3px] flex-none cursor-col-resize transition-colors hover:bg-[var(--surface-hover)]"
-          style={{ background: "var(--border)" }}
-        />
+          </>
+        )}
 
         <EditorPane
           file={openFile}
