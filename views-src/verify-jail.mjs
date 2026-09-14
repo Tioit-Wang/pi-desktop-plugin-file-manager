@@ -187,8 +187,32 @@ async function main() {
     staleListing.entries?.some((entry) => entry.name === "only-in-alpha.txt") === true,
     JSON.stringify(staleListing).slice(0, 160),
   );
+  console.log("\n7. 宿主用正斜杠报目录（真实宿主就是这样），基点照样跟着记忆走");
+  // 之前这一节不存在，用例里的桩宿主用的是反斜杠，形状太「一致」，于是掩盖了
+  // 「记忆写盘时被 path.resolve 变成反斜杠、宿主却报正斜杠」这条真实链路。
+  workspace.projectId = "grp-1";
+  workspace.path = alpha.replace(/\\/g, "/");
+  workspace.roots = [
+    { path: alpha.replace(/\\/g, "/"), name: "alpha", primary: true },
+    { path: beta.replace(/\\/g, "/"), name: "beta", primary: false },
+  ];
+  await onPanelInvoke("fm.prefs.set", {
+    partial: { projectRoots: { "p:grp-1": beta.replace(/\\/g, "/") } },
+  });
+  const slashListing = await onPanelInvoke("fm.list", { path: "" });
+  check(
+    "切到兄弟文件夹后列的是它自己的文件",
+    slashListing.entries?.some((entry) => entry.name === "only-in-beta.txt") === true,
+    JSON.stringify(slashListing).slice(0, 160),
+  );
+  check(
+    "主根的文件不再出现",
+    !slashListing.entries?.some((entry) => entry.name === "only-in-alpha.txt"),
+  );
 
-  console.log("\n7. 老宿主（不带 roots / projectId）照旧");
+
+  console.log("\n8. 老宿主（不带 roots / projectId）照旧");
+  workspace.path = alpha;
   workspace.roots = undefined;
   workspace.projectId = undefined;
   const legacy = await onPanelInvoke("fm.hello", {});

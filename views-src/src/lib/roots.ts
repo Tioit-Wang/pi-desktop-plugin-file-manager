@@ -38,10 +38,17 @@ function isAbsolutePath(target: string): boolean {
   return target.startsWith("/") || /^[A-Za-z]:[\\/]/.test(target) || target.startsWith("\\\\");
 }
 
-/** 去尾部分隔符后的比较形态；末尾多一个斜杠不代表另一个目录。 */
+/**
+ * 去尾部分隔符、把反斜杠统一成正斜杠后的比较形态。
+ *
+ * 宿主给的目录是正斜杠（`C:/Users/me/Docs`），而这个插件自己的主进程会用 Node 的
+ * `path.resolve()` 把记忆里的值写成反斜杠（`C:\Users\me\Docs`）。同一个目录的这两种
+ * 写法必须算同一个目录，否则「切到 B 之后记住」在写盘那一刻就自己失效了：视图用原样
+ * 字符串还能匹配（头部名字会换），主进程匹配不上就退回主目录（列表不换）。
+ */
 function canonicalPath(target: string): string {
   const trimmed = target.replace(/[\\/]+$/, "");
-  return trimmed || target;
+  return (trimmed || target).replace(/\\/g, "/");
 }
 
 /** 路径 → 段（丢掉空段与 `.`）。两侧都按段比，`\` 与 `/` 混用也不会误判。 */

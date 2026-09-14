@@ -130,6 +130,36 @@ check("相对路径没有「落在哪个 root 里」这回事", roots.findRootFo
 check("父目录不是子目录", roots.relativeInside(join(ALPHA, "lib"), ALPHA) === null);
 
 console.log("\n6. 按项目记忆（LRU）");
+console.log("\n5b. 分隔符不同的同一个目录");
+// 宿主给的目录是正斜杠（`C:/Work/Beta`），而记忆写盘时会被 path.resolve 变成反斜杠
+// （`C:\Work\Beta`）。两者必须是同一个目录，否则「切过去并记住」在写盘那一刻就失效：
+// 视图用原样字符串还能匹配（头部名字会换），主进程匹配不上就退回主目录（列表不换）。
+check(
+  "正斜杠与反斜杠是同一个目录",
+  roots.samePath("C:\\Work\\Beta", "C:/Work/Beta") === true &&
+    roots.samePath("C:/Work/Beta", "C:\\Work\\Beta") === true,
+);
+check(
+  "roots 是反斜杠、记忆是正斜杠时命中",
+  roots.matchRoot(shape, "C:/Work/Beta")?.path === BETA &&
+    roots.resolveSelectedRoot(shape, "C:/Work/Beta")?.path === BETA,
+  JSON.stringify(roots.resolveSelectedRoot(shape, "C:/Work/Beta")),
+);
+const slashRoots = roots.normalizeRoots({
+  path: "C:/Work/Alpha",
+  name: "alpha",
+  projectId: "grp-1",
+  roots: [
+    { path: "C:/Work/Alpha", name: "alpha", primary: true },
+    { path: "C:/Work/Beta", name: "beta", primary: false },
+  ],
+});
+check(
+  "roots 是正斜杠、记忆是反斜杠时命中（真实宿主 + path.resolve 之后的形态）",
+  roots.resolveSelectedRoot(slashRoots, "C:\\Work\\Beta")?.path === "C:/Work/Beta",
+  JSON.stringify(roots.resolveSelectedRoot(slashRoots, "C:\\Work\\Beta")),
+);
+
 const before = { a: "1", b: "2", c: "3" };
 const after = roots.rememberProjectRoot(before, "a", "9");
 check("重写的键挪到末尾", Object.keys(after).join(",") === "b,c,a", Object.keys(after).join(","));
