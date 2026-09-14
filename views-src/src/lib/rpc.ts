@@ -6,6 +6,7 @@
  * onPanelInvoke。宿主对自定义通道的超时是 30s，所以遍历类操作一律分页。
  */
 
+import type { ProjectWorkspace } from "./roots";
 import type { T } from "../i18n";
 
 export type FileEntry = {
@@ -38,6 +39,13 @@ export type Prefs = {
   jsonTree: boolean;
   /** 表格每页行数（100–5000，100 的整数倍；默认 1000）。 */
   tablePageSize: number;
+  /**
+   * 项目组里「当前在看哪个 folder root」的记忆：projectKey → 绝对路径。
+   * projectKey = `p:<projectId>`（宿主给了 projectId 时）或 `r:<主根路径>`；
+   * 值必须命中宿主当前给的 roots 才被信任，否则退回主根；最多 20 条，按最近
+   * 写入做 LRU 淘汰（都在 main.js 的 sanitizePrefs / selectedRootOf 里）。
+   */
+  projectRoots: Record<string, string>;
 };
 
 export type Limits = {
@@ -46,9 +54,14 @@ export type Limits = {
   maxListEntries: number;
 };
 
+/**
+ * 首次握手：项目组（与 workspace.get 同一个形状——path/name 是组的**主根**）、
+ * 当前偏好、上限与忽略规则文件名。「当前在看哪个 folder root」不在这个字段里：
+ * 它是 prefs.projectRoots 里的记忆，视图与主进程都用同一套规则从它推导基点。
+ */
 export type HelloResponse = {
   ok: true;
-  root: { path: string; name: string } | null;
+  root: ProjectWorkspace | null;
   limits: Limits;
   ignoreFiles: string[];
   prefs: Prefs;

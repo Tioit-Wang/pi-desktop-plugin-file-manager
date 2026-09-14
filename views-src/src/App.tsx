@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "./lib/bridge";
 import { watchAppearance, type Base, type Locale as HostLocale } from "./lib/appearance";
-import { watchWorkspace, type Workspace } from "./lib/workspace";
-import { channels, failureMessage, isConflict, type Failure, type FileEntry, type ListResponse, type Prefs, type ReadRequest, type ReadResponse, type SearchHit, type SearchResponse, type WriteRequest, type WriteResponse } from "./lib/rpc";
+import { watchWorkspace, workspaceKey, type Workspace } from "./lib/workspace";
+import { channels, failureMessage, isConflict, type Failure, type FileEntry, type HelloResponse, type ListResponse, type Prefs, type PrefsResponse, type ReadRequest, type ReadResponse, type SearchHit, type SearchResponse, type WriteRequest, type WriteResponse } from "./lib/rpc";
 import { baseNameOf, parentOf } from "./lib/format";
+import { findRootForPath, normalizeRoots, primaryRootOf, projectKeyOf, rememberProjectRoot, resolveSelectedRoot, samePath, type WorkspaceRoot } from "./lib/roots";
+
 import { makeT, type T } from "./i18n";
 import { resolveViewer, type ViewerMode } from "./lib/viewers";
 import { toOpenFile, withSavedContent, type OpenFile } from "./lib/openFile";
@@ -26,6 +28,16 @@ type Prompt =
   | null;
 type Conflict = { mtimeMs: number; size: number } | null;
 type Menu = { x: number; y: number; entry: FileEntry | null } | null;
+
+/** `a/b/c.txt` → ["a", "a/b"]：打开文件前要逐级展开并加载的祖先目录。 */
+function ancestorPaths(relPath: string): string[] {
+  const segments = relPath.split("/");
+  const parents: string[] = [];
+  for (let index = 1; index < segments.length; index += 1) {
+    parents.push(segments.slice(0, index).join("/"));
+  }
+  return parents;
+}
 
 const SEARCH_PAGE = 60;
 
@@ -52,6 +64,7 @@ export default function App() {
     csvTable: true,
     jsonTree: false,
     tablePageSize: 1000,
+    projectRoots: {},
   });
   const [ignoreActive, setIgnoreActive] = useState(false);
   const [guard, setGuard] = useState<Guard>(null);
@@ -60,6 +73,13 @@ export default function App() {
   const [menu, setMenu] = useState<Menu>(null);
   const [query, setQuery] = useState("");
   const [search, setSearch] = useState<SearchState>({ hits: [], running: false, done: true });
+  /** 头部左上角切换器的菜单锚点（null = 没打开）。 */
+  const [rootMenu, setRootMenu] = useState<{ x: number; y: number } | null>(null);
+  /**
+   * 组信息与偏好（含 root 记忆）都到手了。在那之前宿主请求要先排队 —— 不知道
+   * 主根是谁就判断不了「相对路径其实指主根」，也不知道基点该不该切。
+   */
+  const [ready, setReady] = useState(false);
 
   const handleRef = useRef<EditorHandle | null>(null);
   const dirsRef = useRef(directories);
@@ -81,6 +101,29 @@ export default function App() {
   const loadRef = useRef<(path: string, force?: boolean) => Promise<void>>(async () => {});
   /** 宿主请求（入口查询串 / view:open 推送）统一走它。 */
   const hostOpenRef = useRef<(request: HostOpenRequest) => void>(() => {});
+  /** 宿主请求在 ready 之前到达时先排队，见下面 ready 的 flush effect。 */
+  const pendingHostOpenRef = useRef<HostOpenRequest | null>(null);
+  /** 组已经到过，但偏好还没到手：那一份先压着，由 hello 放出去。 */
+  const pendingWorkspaceRef = useRef<Workspace | null | undefined>(undefined);
+  /** hello 回来过（偏好与 root 记忆都知道了）。 */
+  const prefsLoadedRef = useRef(false);
+  /** 组走完第一轮 applyWorkspace 之前，宿主请求先排队（见 ready 的 flush effect）。 */
+  const readyRef = useRef(false);
+  /**
+   * 已经应用过的组身份，用来吃掉首次的重复投递（workspace.get 与 hello 并发）。
+   * 初值刻意是 undefined 而不是 null：null 是「没有打开项目」这个合法身份。
+   */
+  const appliedKeyRef = useRef<string | null | undefined>(undefined);
+  const applyRef = useRef<(workspace: Workspace | null) => void>(() => {});
+  /** 最新的一份偏好（含 root 记忆）；跨 await 的回调要读到最新值。 */
+  const prefsRef = useRef(prefs);
+  const rootRef = useRef<Workspace | null>(root);
+  /** 当前基点；宿主请求要先拿它比对「要不要切」。 */
+  const activeRootRef = useRef<WorkspaceRoot | null>(null);
+  /** 头部切换器的按钮节点：菜单关掉后把焦点还给它。 */
+  const rootButtonRef = useRef<HTMLButtonElement | null>(null);
+  /** 切换器按钮按下时菜单是否已经开着（见 openRootMenu）。 */
+  const armedRef = useRef(false);
 
   // 让回调读到最新值而不必重订阅。
   const dirtyRef = useRef(dirty);
@@ -92,6 +135,68 @@ export default function App() {
   openPathRef.current = openFile ? openFile.path : null;
   currentNameRef.current = openFile ? baseNameOf(openFile.path) : t("projectFiles");
   tRef.current = t;
+  prefsRef.current = prefs;
+  rootRef.current = root;
+
+  // 组里全部 folder root（宿主没给 roots 时只有一个，就是主根）。
+  const roots = useMemo(() => (root ? normalizeRoots(root) : []), [root]);
+  /**
+   * 当前浏览的那个 root：记忆里的路径必须命中组里的 roots，否则退回主根。
+   * 选择不额外存一份 state —— prefs.projectRoots 是唯一真相（main.js 也按它
+   * 推导包含基点），视图只是把它翻译成名字与路径。
+   */
+  const activeRoot = useMemo(
+    () => (root ? resolveSelectedRoot(roots, prefs.projectRoots[projectKeyOf(root)]) : null),
+    [prefs.projectRoots, root, roots],
+  );
+  /** 头部的名字：看到哪个 folder 就显示哪个。 */
+  const headerName = activeRoot?.name ?? root?.name ?? t("title");
+  const rootCount = roots.length;
+
+  // 当前基点写给工具回调（宿主请求要先比对「要不要切」）。
+  activeRootRef.current = activeRoot;
+  /**
+   * 组里多于一个 folder 才有切换器；只有一个 root（或老宿主）时头部就是静态标签。
+   * ready 之前偏好与 root 记忆都还没到手：这时候切换等于拿一份空记忆去落盘，
+   * 而且随后返回的那份旧偏好会把刚选的基点盖回去（视图与主进程的基点就此分叉）。
+   * 所以先只显示静态名字——ready 一到它就是开关。
+   */
+  const switchable = ready && rootCount > 1 && Boolean(activeRoot);
+
+  /**
+   * 换项目 / 换基点共用的一段：树、展开、选中、搜索、打开的文件全部重来。
+   * revision 递增让还在飞的目录列表结果作废（见 loadDirectory 的守卫）。
+   */
+  const resetExplorer = useCallback(() => {
+    revisionRef.current += 1;
+    setDirectories(new Map());
+    setExpanded(new Set());
+    setSelected(null);
+    setOpenFile(null);
+    setDirty(false);
+    setError(null);
+    setQuery("");
+    setSearch({ hits: [], running: false, done: true });
+  }, []);
+
+  /**
+   * 应用一个项目组（workspace.get / hello 的结果）。同一个组重复投递只应用一次：
+   * 轮询与 hello 是两条并发的异步，谁先回来都可能；重复应用会把刚由宿主打开的
+   * 文件又清掉。
+   */
+  const applyWorkspace = useCallback(
+    (workspace: Workspace | null) => {
+      const key = workspaceKey(workspace);
+      if (key === appliedKeyRef.current) return;
+      appliedKeyRef.current = key;
+      setRoot(workspace);
+      resetExplorer();
+      if (workspace) void loadRef.current("", true);
+    },
+    [resetExplorer],
+  );
+
+  applyRef.current = applyWorkspace;
 
   // ── 外观 ─────────────────────────────────────────────────────────────────
 
@@ -107,57 +212,81 @@ export default function App() {
   // ── 工作区切换 ───────────────────────────────────────────────────────────
 
   useEffect(() => {
-    // 订阅工作区变化：路径一变就整体重载（宿主没有给 workpanel 的工作区事件，
-    // 只能靠 workspace.get 的轮询）。有未保存内容时先走守卫。
+    // 订阅工作区变化：组一变就整体重载（宿主没有给 workpanel 的工作区事件，
+    // 只能靠 workspace.get 的轮询；判断键含组 id 与全部 root，见 lib/workspace.ts）。
+    // 有未保存内容时先走守卫。
     // 依赖保持为空：watchWorkspace 订阅时会立刻发一次首次结果，若把 t 放进
     // 依赖，切换语言就会重订阅并再次触发「工作区变化」，把树和文件全清掉。
     return watchWorkspace((workspace) => {
-      const apply = () => {
-        revisionRef.current += 1;
-        setRoot(workspace);
-        setDirectories(new Map());
-        setExpanded(new Set());
-        setSelected(null);
-        setOpenFile(null);
-        setDirty(false);
-        setError(null);
-        setQuery("");
-        setSearch({ hits: [], running: false, done: true });
-        if (workspace) void loadRef.current("", true);
-      };
-
+      // 偏好（含 root 记忆）还没到手就先压着：基点是由记忆决定的，拿着空记忆
+      // 去恢复会加载错目录、还会把用户的选择冲掉。hello 回来后由它放出去。
+      if (!prefsLoadedRef.current) {
+        pendingWorkspaceRef.current = workspace;
+        return;
+      }
+      // 与 0.4.0 一致：换项目时若有未保存的改动，先问一句（换基点走的是另一个
+      // 入口，它自己带守卫，见 switchRoot / applyHostOpen）。
+      const apply = () => applyRef.current(workspace);
       if (dirtyRef.current) {
         pendingRef.current = apply;
         setGuard({ body: tRef.current("dirtyPromptBody", { name: currentNameRef.current }) });
-      } else {
-        apply();
+        return;
       }
+      apply();
     });
   }, []);
 
-  // 首次加载：拿偏好与根目录。
+  useEffect(
+    () =>
+      watchHostOpenRequests((request) => {
+        // 组与偏好还没到手：先排队。此时既不知道主根是谁，也判不出「组内绝对
+        // 路径该落在哪个 root」——把它当项目外路径放行会绕过根内包含校验。
+        // 放行在下面 ready 的 effect 里。
+        if (!readyRef.current) {
+          pendingHostOpenRef.current = request;
+          return;
+        }
+        hostOpenRef.current(request);
+      }),
+    [],
+  );
+
+  // 首次加载：拿偏好、root 记忆与项目组。
+  // 这一步必须是「应用项目组」的唯一发令枪之一（另一处是上面的轮询回调）：
+  // 两条异步（workspace.get 与 fm.hello）谁先回来都可能，统一在这里收口。
   useEffect(() => {
     void (async () => {
+      let workspace: Workspace | null = null;
       try {
-        const hello = await invoke<{ ok: true; root: Workspace | null; prefs: Prefs }>(
-          channels.hello,
-        );
+        const hello = await invoke<HelloResponse>(channels.hello);
         if (hello?.ok) {
           setPrefs(hello.prefs);
-          setRoot(hello.root);
+          workspace = hello.root;
         }
       } catch {
-        /* 根目录由 watchWorkspace 兜底 */
+        /* 偏好拿不到就按默认值继续：不能把视图卡在「没加载」上 */
       }
+      prefsLoadedRef.current = true;
+
+      const queued = pendingWorkspaceRef.current;
+      pendingWorkspaceRef.current = undefined;
+      // 轮询先回来的那份更权威（它就是 workspace.get 的原始结果）；它缺席时
+      // 才用 hello 自己带的（组 + 主根 + 选中的 root 记忆）。
+      const first = queued ?? workspace;
+      applyRef.current(first);
+      readyRef.current = true;
+      setReady(true);
     })();
   }, []);
 
-  // ── 宿主要求打开某个文件 ─────────────────────────────────────────────────
-  //
-  // 两条投递路径的去重与优先级都在 lib/hostOpen.ts 里；这里只订阅一次，回调经
-  // ref 取最新实现——把 t / loadDirectory 放进依赖会让切换语言时重订阅，把
-  // 同一条请求再放一遍。
-  useEffect(() => watchHostOpenRequests((request) => hostOpenRef.current(request)), []);
+  // ready 之后才放行排队的宿主请求：这个 effect 在应用完项目组的那次渲染之后
+  // 才跑，所以 applyHostOpen 读到的组、基点与偏好都是最新的。
+  useEffect(() => {
+    if (!ready) return;
+    const pending = pendingHostOpenRef.current;
+    pendingHostOpenRef.current = null;
+    if (pending) hostOpenRef.current(pending);
+  }, [ready]);
 
   // ── 目录操作 ─────────────────────────────────────────────────────────────
 
@@ -278,42 +407,124 @@ export default function App() {
     void invoke(channels.prefsSet, { partial }).catch(() => {});
   }, []);
 
+  // ── 项目组：切换正在浏览的 folder root ───────────────────────────────────
+
+  /**
+   * 换基点。落盘必须**等它写完**再往下走：包含基点是从 prefs.projectRoots 推导出
+   * 来的（main.js 的 selectedRootOf），写没到，下一个通道请求就会按旧基点解析。
+   * 落盘失败就什么都不换——宁可让这次切换失败，也不能让树和包含基点各说各话。
+   */
+  const activateRoot = useCallback(
+    async (target: WorkspaceRoot): Promise<boolean> => {
+      const workspace = rootRef.current;
+      if (!workspace) return false;
+      const memory = rememberProjectRoot(
+        prefsRef.current.projectRoots,
+        projectKeyOf(workspace),
+        target.path,
+      );
+      const response = await invoke<PrefsResponse>(channels.prefsSet, {
+        partial: { projectRoots: memory },
+      }).catch(() => null);
+      if (!response || !response.ok) {
+        setError(tRef.current("switchFailed"));
+        return false;
+      }
+      setPrefs((prev) => ({ ...prev, projectRoots: memory }));
+      resetExplorer();
+      await loadRef.current("", true);
+      return true;
+    },
+    [resetExplorer],
+  );
+
+  /** 切换器里点了一个 folder：照旧先过脏缓冲守卫，取消就什么都不改。 */
+  const switchRoot = (target: WorkspaceRoot) => {
+    if (!activeRoot || samePath(activeRoot.path, target.path)) return;
+    withGuard(() => void activateRoot(target));
+  };
+
+  /** 菜单锚在控件下方；ContextMenu 自己会按视口夹取，靠边也不会跑出去。 */
+  const openRootMenu = (event: React.MouseEvent<HTMLButtonElement>) => {
+    if (armedRef.current) {
+      armedRef.current = false;
+      setRootMenu(null);
+      return;
+    }
+    const rect = event.currentTarget.getBoundingClientRect();
+    setRootMenu({ x: rect.left, y: rect.bottom + 4 });
+  };
+
+  /** 关菜单，并把手柄交回按钮——Escape 之后键盘还能接着用。 */
+  const closeRootMenu = () => {
+    armedRef.current = false;
+    setRootMenu(null);
+    rootButtonRef.current?.focus();
+  };
+
+  /** 组的文件夹列表：主根标出「主文件夹」，当前在看的那个打勾。 */
+  const rootMenuEntries = (): MenuEntry[] =>
+    roots.map((entry) => ({
+      kind: "item",
+      label: entry.name,
+      hint: entry.primary ? t("primaryRoot") : undefined,
+      icon: activeRoot && samePath(entry.path, activeRoot.path) ? <CheckGlyph /> : undefined,
+      onPick: () => switchRoot(entry),
+    }));
+
   /**
    * 宿主要求打开的文件：两条投递路径（入口查询串 / view:open 推送）最终都落到
-   * 这里。视觉结果与在树里点这个文件一致，因此复用 openEntry 与它的脏缓冲守
-   * 卫；项目外的绝对路径不在树里，既不展开也不高亮（选中态在 openEntry 里被
-   * 置空）。宿主请求一律把左侧列表收起并持久化，用户之后重新展开会一直保持到
-   * 下一次宿主请求。
+   * 这里。三种路径形态各有各的基准（0.5.0）：
+   *   项目内相对路径 → 基准是**主根**；当前看的不是主根就先切回主根再打开。
+   *   组内绝对路径   → 切到包含它的那个 root，再按「相对那个 root」打开（祖先
+   *                    目录照旧展开、行照旧高亮，与点击搜索结果一致）。
+   *   组外绝对路径   → 0.4.0 的外部行为：不进树、不高亮、基点不动。
+   * 换基点必须先落盘（见 activateRoot）——包含基点由 prefs.projectRoots 推导。
+   * 视觉结果与在树里点这个文件一致，因此复用 openEntry 与它的脏缓冲守卫；宿主
+   * 请求一律把左侧列表收起并持久化，用户之后重新展开会一直保持到下一次宿主请求。
    */
   const applyHostOpen = useCallback(
     (request: HostOpenRequest) => {
-      const path = request.path;
+      const rawPath = request.path;
+      const absolute = isExternalPath(rawPath);
+      // 组的 root 列表还没到手时（ready 之前）这个请求会被排队，见下面 ready 的 effect。
+      const contained = absolute ? findRootForPath(roots, rawPath) : null;
+      const base = contained ? contained.root : absolute ? null : primaryRootOf(roots);
+      const relPath = contained ? contained.rel : rawPath;
+
       persistPrefs({ treeCollapsed: true });
 
-      // 已经是这个文件：不重装文档，也就不必为脏缓冲再问一遍。
-      if (path === openPathRef.current) return;
-
-      if (isExternalPath(path)) {
-        withGuard(() => void openEntry({ path }));
-        return;
-      }
-
-      // 项目内路径：展开并加载祖先目录，与搜索命中的跳转是同一套做法。
-      const segments = path.split("/");
-      const parents: string[] = [];
-      for (let index = 1; index < segments.length; index += 1) {
-        parents.push(segments.slice(0, index).join("/"));
-      }
-      withGuard(() => {
-        setSelected(path);
+      const show = () => {
+        // 已经是这个文件：不重装文档，也就不必为脏缓冲再问一遍。
+        if (relPath === openPathRef.current) return;
+        // 组外的绝对路径不在树里：不展开、也不高亮（openEntry 会把选中态置空）。
+        if (!contained && absolute) {
+          void openEntry({ path: relPath });
+          return;
+        }
+        // 项目内路径：展开并加载祖先目录，与搜索命中的跳转是同一套做法。
+        const parents = ancestorPaths(relPath);
+        setSelected(relPath);
         setExpanded((prev) => new Set([...prev, ...parents]));
         void (async () => {
           for (const parent of parents) await loadDirectory(parent);
-          await openEntry({ path });
+          await openEntry({ path: relPath });
         })();
+      };
+
+      // 基点没变（也包括「没有项目」与组外路径）：直接开，脏缓冲守卫照旧。
+      if (!base || samePath(activeRootRef.current?.path ?? "", base.path)) {
+        withGuard(show);
+        return;
+      }
+      // 要先换基点：换成功再打开；守卫被取消的话基点也不动。
+      withGuard(() => {
+        void activateRoot(base).then((ok) => {
+          if (ok) show();
+        });
       });
     },
-    [loadDirectory, openEntry, persistPrefs, withGuard],
+    [activateRoot, loadDirectory, openEntry, persistPrefs, roots, withGuard],
   );
 
   hostOpenRef.current = applyHostOpen;
@@ -657,9 +868,37 @@ export default function App() {
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" style={{ color: "var(--icon-folder)" }} aria-hidden="true">
             <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" />
           </svg>
-          <span className="min-w-0 truncate text-[12.5px] font-medium">
-            {root?.name ?? t("title")}
-          </span>
+          {switchable ? (
+            /* 组的文件夹多于一个：这个名字本身就是切换器。菜单复用 ContextMenu
+               （Escape 与点到外面都会关、↑↓ / Home / End 可用），按钮自己提供
+               aria-haspopup / aria-expanded 与可读名字。长名字靠 min-w-0 + truncate
+               截断，右侧那几个工具按钮因此不会被挤走。
+               只有一个 root（或老宿主不给组信息）时下面这条静态标签原样保留。 */
+            <button
+              ref={rootButtonRef}
+              type="button"
+              aria-haspopup="menu"
+              aria-expanded={rootMenu !== null}
+              aria-label={t("switchFolderNamed", { name: headerName, count: rootCount })}
+              title={t("switchFolder")}
+              onMouseDown={() => {
+                // ContextMenu 把「按下」当点到外面，会先把菜单关掉；这里记下按之前
+                // 的状态，好在随后那一下 click 里分清「开」与「再点一次要关」。
+                armedRef.current = rootMenu !== null;
+              }}
+              onClick={openRootMenu}
+              className="-mx-1 flex min-w-0 max-w-[18rem] items-center gap-1 rounded-lg border-0 bg-transparent px-1 py-0.5 text-[12.5px] font-medium transition-colors hover:bg-[var(--surface-hover)]"
+            >
+              <span className="min-w-0 truncate">{headerName}</span>
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" className="flex-none" style={{ color: "var(--faint)" }} aria-hidden="true">
+                <path d="m6 9 6 6 6-6" />
+              </svg>
+            </button>
+          ) : (
+            <span className="min-w-0 truncate text-[12.5px] font-medium">
+              {root?.name ?? t("title")}
+            </span>
+          )}
         </span>
 
         <span className="ml-auto flex flex-none items-center gap-1">
@@ -864,6 +1103,16 @@ export default function App() {
         <ContextMenu x={menu.x} y={menu.y} entries={menuEntries()} onClose={() => setMenu(null)} />
       ) : null}
 
+      {/* 组的文件夹菜单：只有一个 root（或老宿主不给组信息）时它根本不会被打开。 */}
+      {rootMenu ? (
+        <ContextMenu
+          x={rootMenu.x}
+          y={rootMenu.y}
+          entries={rootMenuEntries()}
+          onClose={closeRootMenu}
+        />
+      ) : null}
+
       {!root ? (
         <div className="absolute inset-0 flex items-center justify-center" style={{ background: "var(--bg)" }}>
           <div className="max-w-[32ch] text-center">
@@ -1032,5 +1281,14 @@ function IconButton({
         {children}
       </svg>
     </button>
+  );
+}
+
+/** 菜单里的「当前就在看这个」：与树里的展开箭头同一套线条风格。 */
+function CheckGlyph() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="m4 12 5 5L20 6" />
+    </svg>
   );
 }
