@@ -175,3 +175,29 @@ export function rememberProjectRoot(
   }
   return bounded;
 }
+
+/** 两个路径片段拼成绝对路径；分隔符跟着 base 走（Windows 上仍是 `\`）。 */
+function joinAbsolute(base: string, rel: string): string {
+  const trimmedBase = base.replace(/[\\/]+$/, "");
+  const trimmedRel = rel.replace(/^[\\/]+/, "");
+  if (!trimmedRel) return trimmedBase;
+  const separator = trimmedBase.includes("\\") ? "\\" : "/";
+  // 条目路径永远是正斜杠（fm.list 的约定），拼出来的绝对路径要跟 base 同一种写法。
+  const tail = separator === "/" ? trimmedRel : trimmedRel.replace(/\//g, "\\");
+  return `${trimmedBase}${separator}${tail}`;
+}
+
+/**
+ * 「用默认应用打开」与「在文件夹中显示」交给宿主执行时要送出去的路径。
+ *
+ * 宿主这两条通道只接受**工作区相对路径**（plugin-runtime 的 resolveFsRequest 会把
+ * 开头的分隔符剥掉、再按工作区根解析），所以：
+ *   - 基点就是主文件夹时，相对路径原样送出去，与 0.4 完全一致；
+ *   - 基点换成了组里的兄弟文件夹时，相对路径会被宿主按**主文件夹**解析——两个文件夹
+ *     里有同名文件的话，打开的就是另一个文件（0.5.0 修掉的正是这个缺陷），因此必须
+ *     送绝对路径。宿主对「本项目已注册文件夹根」下的绝对路径有对应的窄放行（ADR 0253）。
+ */
+export function hostActionPath(entryPath: string, root: WorkspaceRoot | null): string {
+  if (!root || root.primary) return entryPath;
+  return joinAbsolute(root.path, entryPath);
+}

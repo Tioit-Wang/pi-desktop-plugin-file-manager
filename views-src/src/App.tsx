@@ -4,7 +4,7 @@ import { watchAppearance, type Base, type Locale as HostLocale } from "./lib/app
 import { watchWorkspace, workspaceKey, type Workspace } from "./lib/workspace";
 import { channels, failureMessage, isConflict, type Failure, type FileEntry, type HelloResponse, type ListResponse, type Prefs, type PrefsResponse, type ReadRequest, type ReadResponse, type SearchHit, type SearchResponse, type WriteRequest, type WriteResponse } from "./lib/rpc";
 import { baseNameOf, parentOf } from "./lib/format";
-import { findRootForPath, normalizeRoots, primaryRootOf, projectKeyOf, rememberProjectRoot, resolveSelectedRoot, samePath, type WorkspaceRoot } from "./lib/roots";
+import { findRootForPath, hostActionPath, normalizeRoots, primaryRootOf, projectKeyOf, rememberProjectRoot, resolveSelectedRoot, samePath, type WorkspaceRoot } from "./lib/roots";
 
 import { makeT, type T } from "./i18n";
 import { resolveViewer, type ViewerMode } from "./lib/viewers";
@@ -842,12 +842,12 @@ export default function App() {
         {
           kind: "item",
           label: t("openWithApp"),
-          onPick: () => runHostAction("open", target.path),
+          onPick: () => runHostAction("open", hostActionPath(target.path, activeRootRef.current)),
         },
         {
           kind: "item",
           label: t("revealInFolder"),
-          onPick: () => runHostAction("reveal", target.path),
+          onPick: () => runHostAction("reveal", hostActionPath(target.path, activeRootRef.current)),
         },
       );
     }

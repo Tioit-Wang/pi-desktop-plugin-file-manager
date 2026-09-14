@@ -86,7 +86,14 @@ export function EditorPane({
   // 用户刚写的内容换成打开时那份，光标与滚动位置也一起丢。
   useEffect(() => {
     if (!file) {
-      if (loadedToken !== null) setLoadedToken(null);
+      // 换文件夹（或关闭文件）之后，编辑器里不能还留着上一个文件夹的那份文档：
+      // 面板上已经是空态，缓冲区却还在——切回同一相对路径的文件、或者误按
+      // Ctrl+S 都会撞见别人的内容。只有装过文档（loadToken 非空）才需要清一次；
+      // setDocument 会抑制 change 回调，不会把脏标记点亮。
+      if (loadedToken !== null) {
+        handleRef.current?.setDocument("", "", true);
+        setLoadedToken(null);
+      }
       return;
     }
     if (loadedToken === file.loadToken) return;

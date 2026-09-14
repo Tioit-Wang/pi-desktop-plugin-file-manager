@@ -147,7 +147,33 @@ check(
   memory[`k${roots.MAX_PROJECT_ROOTS + 5}`] === "v" && Object.keys(memory).at(-1) === `k${roots.MAX_PROJECT_ROOTS + 5}`,
 );
 
-console.log("\n7. 与主进程那份规则不漂移");
+console.log("\n7. 交给宿主执行的动作要用的路径（用默认应用打开 / 在文件夹中显示）");
+const primaryRoot = { path: ALPHA, name: "alpha", primary: true };
+const siblingRoot = { path: BETA, name: "beta", primary: false };
+check(
+  "基点就是主文件夹时，相对路径原样送出去（与 0.4 完全一致）",
+  roots.hostActionPath("docs/a.md", primaryRoot) === "docs/a.md",
+  roots.hostActionPath("docs/a.md", primaryRoot),
+);
+check(
+  "基点换成兄弟文件夹后送绝对路径——否则宿主会按主文件夹解析同一个相对路径",
+  roots.hostActionPath("docs/a.md", siblingRoot) === `${BETA}\\docs\\a.md`,
+  roots.hostActionPath("docs/a.md", siblingRoot),
+);
+check("没有基点时不做任何变换", roots.hostActionPath("docs/a.md", null) === "docs/a.md");
+check(
+  "去掉基点尾部多余的分隔符",
+  roots.hostActionPath("a.md", { path: `${BETA}\\`, name: "beta", primary: false }) ===
+    `${BETA}\\a.md`,
+  roots.hostActionPath("a.md", { path: `${BETA}\\`, name: "beta", primary: false }),
+);
+check(
+  "POSIX 基点保持正斜杠",
+  roots.hostActionPath("docs/a.md", { path: "/work/beta", name: "beta", primary: false }) ===
+    "/work/beta/docs/a.md",
+);
+
+console.log("\n8. 与主进程那份规则不漂移");
 // 视图与 main.js 是两份独立实现（一个 TypeScript 给界面，一个 CommonJS 给越狱），
 // 没有共享模块。上限、记忆键前缀这一类「两边必须是同一个数/同一串」的东西只能在
 // 这里对文本核对，写歪了就是界面和越狱各按一个基点解析。
