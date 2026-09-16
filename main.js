@@ -915,7 +915,7 @@ async function handleWrite(payload) {
   return { ok: true, mtimeMs: next.mtimeMs, size: next.size };
 }
 
-// ── 新建 / 重命名 / 移动 ────────────────────────────────────────────────────
+// ── 新建 / 重命名 / 移动 / 删除 ────────────────────────────────────────────
 
 const WINDOWS_RESERVED = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
 
@@ -1008,6 +1008,32 @@ async function handleMove(payload) {
 
   await audit({ api: "fm.move", path: `${source.rel} → ${nextRel}`, result: "ok" });
   return { ok: true, entry: entryFromStat(name, nextRel, await fs.stat(nextAbs)) };
+}
+
+/**
+ * 删除文件或目录。目录整体递归删除，删之前由视图弹确认框。
+ *
+ * 路径限制与写 / 新建 / 重命名 / 移动完全一致：resolveTarget(payload, "write")
+ * 覆盖了项目内相对路径、组内绝对路径与 external 项目外路径三种形态，凭据黑名单
+ * 与 node_modules 拒绝都在里面。根目录本身绝不能删——右键空白处的菜单也能走到
+ * 这里，rel 为空就是根。
+ */
+async function handleDelete(payload) {
+  const target = await resolveTarget(payload, "write");
+  // 根目录本身绝不能删：右键空白处的菜单也能走到这里。
+  if (!target.rel) throw fail("INVALID_PATH", "refusing to delete the project root");
+
+  let stat;
+  try {
+    stat = await fs.lstat(target.abs);
+  } catch {
+    throw fail("NOT_FOUND", "entry does not exist");
+  }
+
+  await fs.rm(target.abs, { recursive: stat.isDirectory(), force: false });
+
+  await audit({ api: "fm.delete", path: target.rel, result: "ok" });
+  return { ok: true };
 }
 
 // ── 搜索（分页 + 会话游标） ─────────────────────────────────────────────────
@@ -1701,6 +1727,7 @@ const CHANNELS = {
   "fm.create": handleCreate,
   "fm.rename": handleRename,
   "fm.move": handleMove,
+  "fm.delete": handleDelete,
   "fm.search": handleSearch,
   "fm.sqlite.open": handleSqliteOpen,
   "fm.sqlite.rows": handleSqliteRows,

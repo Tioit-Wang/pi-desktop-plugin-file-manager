@@ -183,6 +183,18 @@ export function rememberProjectRoot(
   return bounded;
 }
 
+/**
+ * 条目路径（相对当前基点）→ 绝对路径，供视图展示与「复制路径」使用。
+ *
+ * 基点就是主文件夹时，条目路径本身就是工作区相对路径，原样返回；
+ * 基点换成了组里的兄弟文件夹时，要拼成绝对路径才有意义。规则与
+ * hostActionPath 完全一致（那是送给宿主执行的同一条路径）。
+ */
+export function absolutePathOf(entryPath: string, root: WorkspaceRoot | null): string {
+  if (!root || root.primary) return entryPath;
+  return joinAbsolute(root.path, entryPath);
+}
+
 /** 两个路径片段拼成绝对路径；分隔符跟着 base 走（Windows 上仍是 `\`）。 */
 function joinAbsolute(base: string, rel: string): string {
   const trimmedBase = base.replace(/[\\/]+$/, "");
@@ -205,6 +217,5 @@ function joinAbsolute(base: string, rel: string): string {
  *     送绝对路径。宿主对「本项目已注册文件夹根」下的绝对路径有对应的窄放行（ADR 0253）。
  */
 export function hostActionPath(entryPath: string, root: WorkspaceRoot | null): string {
-  if (!root || root.primary) return entryPath;
-  return joinAbsolute(root.path, entryPath);
+  return absolutePathOf(entryPath, root);
 }

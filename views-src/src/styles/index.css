@@ -474,12 +474,13 @@ input:focus-visible {
 }
 
 .img-canvas {
-  /* 用 margin:auto 而不是 justify-content:center 做居中：图片比容器大时，
-     居中会把左上角推到可视区之外且滚不到。 */
+  /* 平移与缩放完全由 img 的 transform 接管，这里只负责棋盘格背景与裁剪；
+     img 的布局盒永远是被 max-width/max-height 约束好的适应尺寸（transform
+     不参与排版），所以不需要滚动条。 */
   display: flex;
   min-height: 0;
   flex: 1;
-  overflow: auto;
+  overflow: hidden;
   padding: 16px;
   background-color: var(--surface);
   background-image:
@@ -507,12 +508,16 @@ input:focus-visible {
   margin: auto;
   object-fit: contain;
   user-select: none;
+  /* 缩放围绕图片左上角，锚点公式才算得准；平移量由 transform 的 translate 出。 */
+  transform-origin: 0 0;
+  will-change: transform;
+  cursor: grab;
+  touch-action: none;
 }
 
-/* 实际大小：解除约束，交给滚动条。 */
-.img-stage[data-actual="true"] .img-canvas img {
-  max-width: none;
-  max-height: none;
+/* 拖拽中：光标变 grabbing，由容器上的 data-dragging 控制。 */
+.img-canvas[data-dragging="true"] img {
+  cursor: grabbing;
 }
 
 .img-bar {

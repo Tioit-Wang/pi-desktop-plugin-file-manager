@@ -220,6 +220,7 @@ export type ConflictFailure = {
 export type WriteResponse = WriteOk | ConflictFailure | Failure;
 
 export type EntryResponse = { ok: true; entry: FileEntry | null } | Failure;
+export type DeleteResponse = { ok: true } | Failure;
 
 export type SearchHit = { name: string; path: string; isDirectory: boolean };
 
@@ -268,6 +269,7 @@ export const channels = {
   create: "fm.create",
   rename: "fm.rename",
   move: "fm.move",
+  delete: "fm.delete",
   search: "fm.search",
   sqliteOpen: "fm.sqlite.open",
   sqliteRows: "fm.sqlite.rows",

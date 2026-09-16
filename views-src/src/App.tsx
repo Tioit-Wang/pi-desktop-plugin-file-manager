@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "./lib/bridge";
 import { watchAppearance, type Base, type Locale as HostLocale } from "./lib/appearance";
 import { watchWorkspace, workspaceKey, type Workspace } from "./lib/workspace";
-import { channels, failureMessage, isConflict, type Failure, type FileEntry, type HelloResponse, type ListResponse, type Prefs, type PrefsResponse, type ReadRequest, type ReadResponse, type SearchHit, type SearchResponse, type WriteRequest, type WriteResponse } from "./lib/rpc";
+import { channels, failureMessage, isConflict, type DeleteResponse, type Failure, type FileEntry, type HelloResponse, type ListResponse, type Prefs, type PrefsResponse, type ReadRequest, type ReadResponse, type SearchHit, type SearchResponse, type WriteRequest, type WriteResponse } from "./lib/rpc";
 import { baseNameOf, parentOf } from "./lib/format";
 import { findRootForPath, hostActionPath, normalizeRoots, primaryRootOf, projectKeyOf, rememberProjectRoot, resolveSelectedRoot, samePath, type WorkspaceRoot } from "./lib/roots";
 
@@ -72,6 +72,8 @@ export default function App() {
   const [conflict, setConflict] = useState<Conflict>(null);
   const [menu, setMenu] = useState<Menu>(null);
   const [query, setQuery] = useState("");
+  /** 删除前的确认框（删除不可撤销，必须明确确认）。 */
+  const [confirmDelete, setConfirmDelete] = useState<{ entry: FileEntry } | null>(null);
   const [search, setSearch] = useState<SearchState>({ hits: [], running: false, done: true });
   /** 头部左上角切换器的菜单锚点（null = 没打开）。 */
   const [rootMenu, setRootMenu] = useState<{ x: number; y: number } | null>(null);
@@ -746,6 +748,34 @@ export default function App() {
       setError(String((cause as Error).message));
     }
   };
+  const runDelete = useCallback(
+    async (entry: FileEntry) => {
+      const external = isExternalPath(entry.path);
+      try {
+        const response = await invoke<DeleteResponse | Failure>(channels.delete, {
+          path: entry.path,
+          // 项目外路径要显式声明：主进程只查黑名单，不再要求落在项目根内。
+          ...(external ? { external: true } : {}),
+        });
+        if (!response.ok) {
+          setError(failureMessage(response, t));
+          return;
+        }
+        // 项目外路径没有树目录可刷新，也不参与选中态。
+        if (!external) await loadDirectory(parentOf(entry.path), true);
+        setSelected((prev) => (prev === entry.path ? null : prev));
+        // 删的正是当前打开的文件：编辑器里那份内容已经没有对应的磁盘文件了。
+        if (openPathRef.current === entry.path) {
+          setOpenFile(null);
+          setDirty(false);
+          setError(null);
+        }
+      } catch (cause) {
+        setError(String((cause as Error).message));
+      }
+    },
+    [loadDirectory, t],
+  );
 
   const refreshSelectedDirectory = () => {
     const target = selected ? parentOf(selected) : "";
@@ -820,36 +850,28 @@ export default function App() {
         disabled: !target,
         onPick: () => target && setPrompt({ kind: "move", entry: target }),
       },
-      { kind: "separator" },
       {
         kind: "item",
-        label: t("refresh"),
-        onPick: () => void loadDirectory(dirPath, true),
+        label: t("delete"),
+        disabled: !target,
+        danger: true,
+        onPick: () => {
+          // target 由 disabled 守着，这里一定有；选中态先落，确认框关掉后树里好高亮。
+          if (!target) return;
+          setSelected(target.path);
+          setConfirmDelete({ entry: target });
+        },
       },
+      { kind: "separator" },
     ];
 
     if (target && !isDir) {
-      // 三个都是「对这个文件动手」，插在分隔线之后、重命名之前。
-      // 后两个交给宿主执行，且只对文件有效（宿主会对目录报 INVALID_ARGUMENT）。
-      entries.splice(
-        3,
-        0,
-        {
-          kind: "item",
-          label: t("open"),
-          onPick: () => withGuard(() => void openEntry(target)),
-        },
-        {
-          kind: "item",
-          label: t("openWithApp"),
-          onPick: () => runHostAction("open", hostActionPath(target.path, activeRootRef.current)),
-        },
-        {
-          kind: "item",
-          label: t("revealInFolder"),
-          onPick: () => runHostAction("reveal", hostActionPath(target.path, activeRootRef.current)),
-        },
-      );
+      // 交给宿主执行（fs.reveal），受 manifest 里声明的 fs.read 范围约束，且只对文件有效。
+      entries.push({
+        kind: "item",
+        label: t("revealInFolder"),
+        onPick: () => runHostAction("reveal", hostActionPath(target.path, activeRootRef.current)),
+      });
     }
     return entries;
   };
@@ -864,6 +886,16 @@ export default function App() {
         className="flex min-h-[38px] flex-none flex-wrap items-center gap-2 border-b px-2.5 py-1.5"
         style={{ borderColor: "var(--border)", background: "var(--surface)" }}
       >
+        {/* 显示 / 隐藏文件列表：收起状态下这是重新展开的唯一入口，所以常驻 header 最左侧。 */}
+        <IconButton
+          label={prefs.treeCollapsed ? t("showTree") : t("hideTree")}
+          active={!prefs.treeCollapsed}
+          onClick={() => persistPrefs({ treeCollapsed: !prefs.treeCollapsed })}
+        >
+          <rect x="3" y="3" width="18" height="18" rx="2" />
+          <path d="M9 3v18" />
+          {prefs.treeCollapsed ? <path d="m13 9 3 3-3 3" /> : <path d="m16 9-3 3 3 3" />}
+        </IconButton>
         <span className="flex min-w-0 items-center gap-1.5">
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" style={{ color: "var(--icon-folder)" }} aria-hidden="true">
             <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" />
@@ -902,32 +934,6 @@ export default function App() {
         </span>
 
         <span className="ml-auto flex flex-none items-center gap-1">
-          <IconButton
-            label={prefs.treeCollapsed ? t("showTree") : t("hideTree")}
-            active={!prefs.treeCollapsed}
-            onClick={() => persistPrefs({ treeCollapsed: !prefs.treeCollapsed })}
-          >
-            <rect x="3" y="3" width="18" height="18" rx="2" />
-            <path d="M9 3v18" />
-            {prefs.treeCollapsed ? <path d="m13 9 3 3-3 3" /> : <path d="m16 9-3 3 3 3" />}
-          </IconButton>
-          <IconButton label={t("newFile")} onClick={() => setPrompt({ kind: "newFile", parent: selectedDirPath() })}>
-            <path d="M14 3v4a1 1 0 0 0 1 1h4" />
-            <path d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2z" />
-            <path d="M12 11v6M9 14h6" />
-          </IconButton>
-          <IconButton label={t("newFolder")} onClick={() => setPrompt({ kind: "newFolder", parent: selectedDirPath() })}>
-            <path d="M12 10v6M9 13h6" />
-            <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" />
-          </IconButton>
-          <IconButton label={t("rename")} disabled={!selected} onClick={() => selectedEntry() && setPrompt({ kind: "rename", entry: selectedEntry()! })}>
-            <path d="M12 20h9" />
-            <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z" />
-          </IconButton>
-          <IconButton label={t("move")} disabled={!selected} onClick={() => selectedEntry() && setPrompt({ kind: "move", entry: selectedEntry()! })}>
-            <path d="M5 12h14" />
-            <path d="m12 5 7 7-7 7" />
-          </IconButton>
           <IconButton label={t("refresh")} onClick={refreshTree}>
             <path d="M20 11a8 8 0 0 0-14.9-3.9L3 9" />
             <path d="M3 4v5h5" />
@@ -1086,6 +1092,7 @@ export default function App() {
           dirty={dirty}
           saving={saving}
           error={error}
+          activeRoot={activeRoot}
           viewer={viewer}
           tablePageSize={prefs.tablePageSize}
           t={t}
@@ -1193,6 +1200,28 @@ export default function App() {
         />
       ) : null}
 
+      {confirmDelete ? (
+        <ConfirmDialog
+          title={t("deleteTitle")}
+          body={t(confirmDelete.entry.isDirectory ? "deleteBodyDir" : "deleteBodyFile", {
+            name: confirmDelete.entry.name,
+          })}
+          actions={[
+            { label: t("cancel"), onPick: () => setConfirmDelete(null) },
+            {
+              label: t("delete"),
+              variant: "danger",
+              onPick: () => {
+                // 先把状态摘出来再清空：onPick 里 confirmDelete 已经是闭包里的旧值。
+                const current = confirmDelete.entry;
+                setConfirmDelete(null);
+                void runDelete(current);
+              },
+            },
+          ]}
+        />
+      ) : null}
+
       {prompt ? (
         <PromptDialog
           title={
@@ -1227,22 +1256,6 @@ export default function App() {
       ) : null}
     </div>
   );
-
-  function selectedEntry(): FileEntry | null {
-    if (!selected) return null;
-    const parent = parentOf(selected);
-    const entry = dirsRef.current.get(parent)?.entries?.find((item) => item.path === selected);
-    if (entry) return entry;
-    return { path: selected, name: baseNameOf(selected), isDirectory: false } as FileEntry;
-  }
-
-  /** 新建时落到「当前选中目录」里；选中文件则落到它所在目录。 */
-  function selectedDirPath(): string {
-    if (!selected) return "";
-    const entry = selectedEntry();
-    if (entry?.isDirectory) return entry.path;
-    return parentOf(selected);
-  }
 }
 
 function IconButton({

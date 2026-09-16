@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+ import { useCallback, useEffect, useRef, useState } from "react";
 import { createEditor, type EditorHandle } from "../lib/editor";
 import type { Base } from "../lib/appearance";
 import type { T } from "../i18n";
@@ -7,6 +7,9 @@ import { FileIcon } from "../lib/fileIcons";
 import { MarkdownPreview } from "../lib/markdown";
 import { MODE_LABEL, csvDelimiterOf, type ViewerMode, type ViewerView } from "../lib/viewers";
 import { isDocumentLoaded, type OpenFile } from "../lib/openFile";
+ import { invoke } from "../lib/bridge";
+ import { absolutePathOf } from "../lib/roots";
+ import type { WorkspaceRoot } from "../lib/roots";
 import { CsvTable } from "./CsvTable";
 import { ImageView } from "./ImageView";
 import { JsonTree } from "./JsonTree";
@@ -24,7 +27,8 @@ type Props = {
   viewer: ViewerView | null;
   /** 表格每页行数（偏好里记着）。 */
   tablePageSize: number;
-  t: T;
+   activeRoot: WorkspaceRoot | null;
+   t: T;
   handleRef: React.MutableRefObject<EditorHandle | null>;
   onDirty: () => void;
   onSave: () => void;
@@ -36,7 +40,8 @@ type Props = {
 
 export function EditorPane({
   file,
-  base,
+   base,
+   activeRoot,
   locale,
   dirty,
   saving,
@@ -55,6 +60,57 @@ export function EditorPane({
   const hostRef = useRef<HTMLDivElement | null>(null);
   // 编辑器里装的是哪一次「从磁盘读进来」的内容；null = 还没装。
   const [loadedToken, setLoadedToken] = useState<number | null>(null);
+
+  // 地址栏的路径要按当前基点展开成绝对路径：基点是主文件夹时它本来就是
+  // 工作区相对路径，基点是组里的兄弟文件夹时拼出来才有意义。
+  const displayPath = file ? absolutePathOf(file.path, activeRoot) : "";
+
+  const [copied, setCopied] = useState(false);
+  const copyTimer = useRef<number | null>(null);
+  const copyPath = useCallback(
+    async (path: string) => {
+      let ok = false;
+      try {
+        if (navigator.clipboard?.writeText) {
+          await navigator.clipboard.writeText(path);
+          ok = true;
+        }
+      } catch {
+        ok = false;
+      }
+      // file:// 沙箱页可能没有安全上下文，clipboard API 会失败：退回 execCommand。
+      if (!ok) {
+        try {
+          const textarea = document.createElement("textarea");
+          textarea.value = path;
+          textarea.style.position = "fixed";
+          textarea.style.opacity = "0";
+          document.body.appendChild(textarea);
+          textarea.select();
+          ok = document.execCommand("copy");
+          document.body.removeChild(textarea);
+        } catch {
+          ok = false;
+        }
+      }
+      if (copyTimer.current !== null) window.clearTimeout(copyTimer.current);
+      if (ok) {
+        setCopied(true);
+        copyTimer.current = window.setTimeout(() => setCopied(false), 1200);
+        void invoke("ui.showToast", { message: t("pathCopied", { path }) }).catch(() => {});
+      } else {
+        void invoke("ui.showToast", { message: t("copyFailed") }).catch(() => {});
+      }
+    },
+    [t],
+  );
+
+  // 卸载时别让「已复制」的回退计时器再去 setState。
+  useEffect(() => {
+    return () => {
+      if (copyTimer.current !== null) window.clearTimeout(copyTimer.current);
+    };
+  }, []);
 
   // 编辑器只在挂载时创建一次，所以回调必须经 ref 转发，
   // 否则 Ctrl+S 会一直调用「首帧那次渲染」闭包里的 onSave（那时还没有打开文件）。
@@ -144,13 +200,17 @@ export function EditorPane({
         {file ? (
           <>
             <FileIcon name={baseNameOf(file.path)} isDirectory={false} />
-            <span
-              className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap font-mono text-[11px]"
-              title={file.path}
-              dir="rtl"
-            >
-              {file.path}
-            </span>
+             <button
+               type="button"
+               className="min-w-0 flex-1 cursor-pointer overflow-hidden text-ellipsis whitespace-nowrap border-0 bg-transparent p-0 text-left font-mono text-[11px] transition-colors hover:text-[var(--fg)]"
+               style={{ color: "var(--secondary)" }}
+               title={t("copyPath")}
+               aria-label={t("copyPath")}
+               onClick={() => copyPath(displayPath)}
+             >
+               {displayPath}
+               {copied ? <span style={{ color: "var(--accent)" }}> ✓</span> : null}
+             </button>
             <span className="flex-none text-[10px] tabular-nums" style={{ color: "var(--muted)" }}>
               {formatSize(file.size)}
             </span>
