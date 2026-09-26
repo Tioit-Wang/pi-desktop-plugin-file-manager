@@ -115,6 +115,11 @@ export type Prefs = {
    */
   treeCollapsed: boolean;
   showIgnored: boolean;
+  /**
+   * 监听外部改动并自动刷新（0.8.0）。关掉之后回到「只有手动刷新」——两个按钮都
+   * 一直在，监听只是省掉那一下点击。
+   */
+  watchFiles: boolean;
   /** Markdown 默认打开为预览还是编辑；只对 .md/.markdown/.mdx 生效。 */
   mdPreview: boolean;
   /** CSV/TSV 默认打开为表格还是源码。 */
@@ -148,6 +153,8 @@ export type HelloResponse = {
   root: ProjectWorkspace | null;
   limits: Limits;
   ignoreFiles: string[];
+  /** 监听能力：不能监听时视图不给一个永远没反应的开关。 */
+  watch: WatchCapability;
   prefs: Prefs;
 };
 
@@ -322,6 +329,28 @@ export type SearchResponse = {
 
 export type PrefsResponse = { ok: true; prefs: Prefs } | Failure;
 
+/**
+ * 外部改动的增量（0.8.0）。视图拿着上次的 revision 来问，主进程只回「这之后变了
+ * 哪些根相对路径」。
+ *
+ * 没有推送通道（宿主只给 ui.showToast 这类单向通知），所以是这个形状：主进程负责
+ * 用 fs.watch 盯着，视图低频来取。
+ */
+export type WatchResponse = {
+  ok: true;
+  /** 这个运行时能不能监听；false 时视图把「自动刷新」开关显示成不可用。 */
+  available: boolean;
+  /** 游标：下次带着它来问。 */
+  revision: number;
+  /** 变了哪些路径（根相对）。空串 = 只知道根底下有东西变了（平台没给文件名）。 */
+  changed: string[];
+  /** 游标已经落到有界历史之外：可能还有没看到的，视图据此做一次保守刷新。 */
+  stale: boolean;
+};
+
+/** 首次握手里的监听能力（视图据此决定开关是否可用）。 */
+export type WatchCapability = { available: boolean };
+
 export type ReadRequest = {
   path: string;
   /**
@@ -363,6 +392,7 @@ export const channels = {
   sqliteRows: "fm.sqlite.rows",
   sqliteQuery: "fm.sqlite.query",
   gitDiff: "fm.git.diff",
+  watch: "fm.watch",
 } as const;
 
 /** 把失败响应统一成人话，供 UI 直接展示。 */

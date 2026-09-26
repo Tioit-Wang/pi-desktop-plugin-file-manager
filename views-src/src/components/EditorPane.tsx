@@ -30,6 +30,11 @@ type Props = {
   viewer: ViewerView | null;
   /** 表格每页行数（偏好里记着）。 */
   tablePageSize: number;
+  /**
+   * 打开的文件在外部被改动、而缓冲里还有未保存的改动（0.8.0）。
+   * 这种情况下**不自动装载**（会丢掉用户刚敲的字），只亮一条提示。
+   */
+  externalChange: boolean;
    activeRoot: WorkspaceRoot | null;
   /**
    * 当前文件的 git 状态（0.7.0）。为 null 时工具栏就没有「变更」入口。
@@ -65,6 +70,7 @@ export function EditorPane({
   error,
   viewer,
   tablePageSize,
+  externalChange,
   git,
   t,
   handleRef,
@@ -194,7 +200,6 @@ export function EditorPane({
   const editorHidden =
     structured || Boolean(imageSrc) || Boolean(mediaSrc) || Boolean(sqlite) || diffOpen;
 
-
   const liveText =
     isDocumentLoaded(file, loadedToken) && file
       ? handleRef.current?.text() ?? file.text
@@ -280,9 +285,6 @@ export function EditorPane({
               </div>
             ) : null}
 
-            {/* 变更（0.7.0）：只有这个文件相对 HEAD 有变化时才有，点了在右侧
-                展开差异视图。它与上面的视图切换器并列，但语义不同——那组切的是
-                「同一份内容的看法」，这一组是「另一个内容」。 */}
             {git ? (
               <button
                 type="button"
@@ -340,6 +342,28 @@ export function EditorPane({
       {/* 外部改动提示（0.8.0）：只有「有未保存改动」时才会出现——没改动的文件早
           就自动重新读取了，这里无事可提示。按钮走的是既有的「重新加载」，它内部
           已经带未保存确认框（保存 / 放弃 / 取消），所以这条横幅不重复造逻辑。 */}
+      {externalChange && file ? (
+        <div
+          className="flex flex-none items-center gap-2 px-3 py-2 text-[11.5px]"
+          role="status"
+          style={{
+            background: "color-mix(in oklab, var(--git-modified) 14%, transparent)",
+            color: "var(--fg)",
+            borderBottom: "1px solid var(--border)",
+          }}
+        >
+          <span>{t("externalChanged")}</span>
+          <button
+            type="button"
+            onClick={onReload}
+            className="rounded border-0 bg-transparent px-1 text-[11px] underline underline-offset-2"
+            style={{ color: "var(--secondary)" }}
+          >
+            {t("reload")}
+          </button>
+        </div>
+      ) : null}
+
       {readOnlyReason ? (
         <div
           className="flex flex-none items-center gap-2 px-3 py-2 text-[11.5px]"
@@ -368,7 +392,6 @@ export function EditorPane({
       <div className="relative min-h-0 flex-1 overflow-hidden">
         <div ref={hostRef} className="h-full" />
 
-        {/* 下面四种「整块」视图互斥：差异打开时，编辑器和结构化视图都不挂载。 */}
         {structured && file && mode === "markdown" ? (
           <div className="md-scroll">
             <div className="md-body">
@@ -410,8 +433,6 @@ export function EditorPane({
 
         {file && sqlite ? (
           <SqliteView
-            // 带上 loadToken：工具栏的「重新加载」会重新读一次头部，key 一变就重挂载，
-            // schema 与当前页数据跟着刷新（数据库不能被编辑，所以只有这一种变化来源）
             key={`${file.path}#${file.loadToken}`}
             path={file.path}
             info={sqlite.info}

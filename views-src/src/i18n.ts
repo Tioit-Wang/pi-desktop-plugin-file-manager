@@ -184,6 +184,10 @@ export const COPY_TABLES = {
     gitDiffTruncated: "output truncated",
     gitScopeStaged: "Staged (HEAD → index)",
     gitScopeWorktree: "Working tree (index → disk)",
+    watchOn: "Auto-refresh when files change on disk",
+    watchOff: "Auto-refresh off — use the refresh buttons",
+    watchUnavailable: "This runtime cannot watch for file changes",
+    externalChanged: "This file changed on disk. Reload to see it — your unsaved changes are still here.",
   },
   zh: {
     title: "文件管理器",
@@ -359,6 +363,10 @@ export const COPY_TABLES = {
     gitDiffTruncated: "输出已截断",
     gitScopeStaged: "已暂存（HEAD → 暂存区）",
     gitScopeWorktree: "工作区（暂存区 → 磁盘）",
+    watchOn: "自动刷新：文件在磁盘上被改动就重新读取",
+    watchOff: "自动刷新已关闭，改用刷新按钮",
+    watchUnavailable: "当前运行时无法监听文件改动",
+    externalChanged: "此文件已在磁盘上被改动，重新加载即可看到；你未保存的改动还在。",
   },
 } as const;
 
