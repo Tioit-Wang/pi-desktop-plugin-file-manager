@@ -2,7 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "./lib/bridge";
 import { watchAppearance, type Base, type Locale as HostLocale } from "./lib/appearance";
 import { watchWorkspace, workspaceKey, type Workspace } from "./lib/workspace";
-import { channels, failureMessage, isConflict, type DeleteResponse, type Failure, type FileEntry, type HelloResponse, type ListResponse, type Prefs, type PrefsResponse, type ReadRequest, type ReadResponse, type SearchHit, type SearchResponse, type WriteRequest, type WriteResponse } from "./lib/rpc";
+import { channels, failureMessage, isConflict, type DeleteResponse, type Failure, type FileEntry, type GitDiffResponse, type GitSummary, type HelloResponse, type ListResponse, type Prefs, type PrefsResponse, type ReadRequest, type ReadResponse, type SearchHit, type SearchResponse, type WriteRequest, type WriteResponse } from "./lib/rpc";
+import { gitSummaryText, lookupGit } from "./lib/git";
 import { baseNameOf, parentOf } from "./lib/format";
 import { findRootForPath, hostActionPath, normalizeRoots, primaryRootOf, projectKeyOf, rememberProjectRoot, resolveSelectedRoot, samePath, type WorkspaceRoot } from "./lib/roots";
 
@@ -11,6 +12,7 @@ import { resolveViewer, type ViewerMode } from "./lib/viewers";
 import { toOpenFile, withSavedContent, type OpenFile } from "./lib/openFile";
 import { openWithDefaultApp, revealInFileManager } from "./lib/hostActions";
 import { isExternalPath, watchHostOpenRequests, type HostOpenRequest } from "./lib/hostOpen";
+import type { DiffViewState } from "./components/GitDiffView";
 import { Tree, type DirState } from "./components/Tree";
 import { EditorPane } from "./components/EditorPane";
 import { ConfirmDialog, PromptDialog } from "./components/Dialogs";
@@ -41,6 +43,7 @@ function ancestorPaths(relPath: string): string[] {
 
 const SEARCH_PAGE = 60;
 
+
 export default function App() {
   const [hostLocale, setHostLocale] = useState<HostLocale>("en");
   const [base, setBase] = useState<Base>(() =>
@@ -66,6 +69,10 @@ export default function App() {
     tablePageSize: 1000,
     projectRoots: {},
   });
+  /** 整个工作区的 git 概览（分支 + 各状态计数），跟着最近一次列表刷新。 */
+  const [gitSummary, setGitSummary] = useState<GitSummary | null>(null);
+  /** 差异视图：path + 加载态。null = 右侧仍是编辑器。 */
+  const [diff, setDiff] = useState<(DiffViewState & { path: string }) | null>(null);
   const [ignoreActive, setIgnoreActive] = useState(false);
   const [guard, setGuard] = useState<Guard>(null);
   const [prompt, setPrompt] = useState<Prompt>(null);
@@ -88,6 +95,12 @@ export default function App() {
   const revisionRef = useRef(0);
   const openTokenRef = useRef(0);
   const searchTokenRef = useRef(0);
+  /** 差异请求的守卫：连点「刷新」时只有最后一次的结果算数。 */
+  const diffTokenRef = useRef(0);
+  /** 当前差异视图对应哪个文件；保存 / 重新加载后据此决定要不要重取。 */
+  const diffPathRef = useRef<string | null>(null);
+  /** loadDiff 经 ref 转发：openEntry 定义在它之前，却要在读完之后回调它。 */
+  const loadDiffRef = useRef<(path: string) => void>(() => {});
   // 每次「从磁盘装载」递增，写进 OpenFile.loadToken：编辑器据此区分
   // 「换文件 / 重新加载」与「保存后更新 mtime」。见 lib/openFile.ts。
   const loadTokenRef = useRef(0);
@@ -139,6 +152,8 @@ export default function App() {
   tRef.current = t;
   prefsRef.current = prefs;
   rootRef.current = root;
+  // 跨 await 的回调（保存成功后）要读到差异视图当前对应哪个文件。
+  diffPathRef.current = diff ? diff.path : null;
 
   // 组里全部 folder root（宿主没给 roots 时只有一个，就是主根）。
   const roots = useMemo(() => (root ? normalizeRoots(root) : []), [root]);
@@ -179,6 +194,9 @@ export default function App() {
     setError(null);
     setQuery("");
     setSearch({ hits: [], running: false, done: true });
+    // 概览与徽标都是「上一个 root 的」，换项目 / 换文件夹必须一起清掉。
+    setGitSummary(null);
+    setDiff(null);
   }, []);
 
   /**
@@ -317,6 +335,9 @@ export default function App() {
         // 「项目里有没有忽略规则」只有根目录那次列表能回答，用来提示用户
         // 树里为什么少了一些条目（工具栏的眼睛按钮可以切回显示）。
         if (path === "") setIgnoreActive(response.ignoreActive);
+        // 概览是整个工作区的（与列的是哪个目录无关），所以任何一次列表刷新都拿
+        // 最新的一份回来；徽标已经随每条 entry 一起进来了。
+        setGitSummary(response.git ?? null);
       } catch (cause) {
         if (revision !== revisionRef.current) return;
         setDir({ error: String((cause as Error).message) });
@@ -352,6 +373,51 @@ export default function App() {
 
   // ── 打开 / 保存 ──────────────────────────────────────────────────────────
 
+  // ── git 差异（0.7.0） ────────────────────────────────────────────────────
+
+  /**
+   * 取一个文件的变更内容。差异是「现算」的：主进程那边有 2s 的快照缓存，所以
+   * 连点两次刷新不会把 git 跑两遍；这里只负责把加载态与失败文案接上。
+   *
+   * 失败不弹全局错误横幅——它只影响右侧这一块，树与编辑器都还能用。
+   */
+  const loadDiff = useCallback(
+    async (path: string) => {
+      const token = ++diffTokenRef.current;
+      setDiff({ path, status: "loading" });
+      try {
+        const response = await invoke<GitDiffResponse>(channels.gitDiff, { path });
+        if (token !== diffTokenRef.current) return;
+        if (!response.ok) {
+          setDiff({ path, status: "error", message: failureMessage(response, t) });
+          return;
+        }
+        setDiff({ path, status: "ready", response });
+      } catch (cause) {
+        if (token !== diffTokenRef.current) return;
+        setDiff({ path, status: "error", message: String((cause as Error).message) });
+      }
+    },
+    [t],
+  );
+
+  loadDiffRef.current = loadDiff;
+
+  /** 打开某个文件的变更视图（工具栏的「变更」按钮 / 右键的「查看变更」）。 */
+  const openDiff = useCallback(
+    (path: string) => {
+      // 项目外文件（宿主请求打开的会话临时文件 / 附件）不在任何仓库里，没有变更。
+      if (!path || isExternalPath(path)) return;
+      void loadDiff(path);
+    },
+    [loadDiff],
+  );
+
+  const closeDiff = useCallback(() => {
+    diffTokenRef.current += 1;
+    setDiff(null);
+  }, []);
+
   /**
    * 打开一个路径。只要 path：宿主请求打开的可能是项目之外的绝对路径（会话
    * 临时目录 / 附件），它没有对应的树条目。
@@ -376,6 +442,14 @@ export default function App() {
         loadTokenRef.current += 1;
         setOpenFile(toOpenFile(response, loadTokenRef.current));
         setDirty(false);
+        // 换文件就收起上一个文件的差异视图（它占着整个右侧）；重新加载同一个文件
+        // 则要按新内容重取——它此刻多半正开着。
+        if (diffPathRef.current === entry.path) {
+          setDiff({ path: entry.path, status: "loading" });
+          loadDiffRef.current(entry.path);
+        } else {
+          setDiff(null);
+        }
       } catch (cause) {
         if (token !== openTokenRef.current) return;
         setError(String((cause as Error).message));
@@ -383,6 +457,7 @@ export default function App() {
     },
     [t],
   );
+
 
   const withGuard = useCallback(
     (action: () => void) => {
@@ -574,6 +649,8 @@ export default function App() {
             setDirty(false);
             // 项目外的文件没有对应的树目录要刷新。
             if (!external) void loadDirectory(parentOf(target.path), true);
+            // 差异视图正开着这个文件时跟着重取：刚存下的内容就是最新的变更。
+            if (diffPathRef.current === target.path) loadDiffRef.current(target.path);
             return true;
           }
           if (isConflict(response)) {
@@ -769,6 +846,8 @@ export default function App() {
           setOpenFile(null);
           setDirty(false);
           setError(null);
+          // 差异视图跟的是同一个文件，文件没了它就没有内容可显示。
+          if (diffPathRef.current === entry.path) closeDiff();
         }
       } catch (cause) {
         setError(String((cause as Error).message));
@@ -813,6 +892,12 @@ export default function App() {
   // 结构化视图（Markdown 预览 / 表格 / 树）只对文本文件成立；具体有哪几种、
   // 默认落在哪一侧，全部由 lib/viewers.ts 一处判定，偏好决定默认值。
   const viewer = openFile && openFile.kind === "text" ? resolveViewer(openFile.path, prefs) : null;
+  /**
+   * 当前打开文件的 git 状态。fm.read 打开那一刻就带回来了（左侧列表收起时也只有
+   * 这一条路）；打开之后才发生的改动——用户自己刚存过一次——由树里的徽标补上，
+   * 否则「保存之后右侧的『变更』按钮凭空消失」。
+   */
+  const openFileGit = openFile ? (openFile.git ?? lookupGit(directories, openFile.path)) : null;
 
   const changeViewerMode = (mode: ViewerMode) => {
     if (!viewer) return;
@@ -866,6 +951,24 @@ export default function App() {
     ];
 
     if (target && !isDir) {
+      // 变更（0.7.0）：只在「这个文件真的有变更」时给入口，没有变更就不摆一个
+      // 点了只会说「没有变更」的死按钮。没展开的目录走 lookupGit 往上找祖先汇总。
+      if (target.git) {
+        entries.push({
+          kind: "item",
+          label: t("viewChanges"),
+          onPick: () => {
+            setMenu(null);
+            // 变更视图占的是编辑器那一块：先把这个文件打开（必要时经过未保存守卫），
+            // 守卫取消就什么都不做。
+            withGuard(() => {
+              const show = () => openDiff(target.path);
+              if (openPathRef.current === target.path) show();
+              else void openEntry({ path: target.path }).then(show);
+            });
+          },
+        });
+      }
       // 交给宿主执行（fs.reveal），受 manifest 里声明的 fs.read 范围约束，且只对文件有效。
       entries.push({
         kind: "item",
@@ -992,8 +1095,12 @@ export default function App() {
                 </IconButton>
               </div>
 
+              {/* 搜索时这行是命中数；平时是 git 概览（分支 + 各类变化的文件数），
+                  也就是「这个工作区现在脏不脏、脏在哪」的一句话。 */}
               <div className="flex flex-none items-center justify-between gap-2 px-3 pb-1 text-[10.5px] font-medium uppercase tracking-wider" style={{ color: "var(--muted)" }}>
-                <span>{searchActive ? t("search") : t("treeSection")}</span>
+                <span className="min-w-0 truncate normal-case">
+                  {searchActive ? t("search") : (gitSummaryText(gitSummary, t) ?? t("treeSection"))}
+                </span>
                 <span className="tabular-nums" style={{ color: "var(--faint)" }}>
                   {searchActive
                     ? search.running
@@ -1093,6 +1200,7 @@ export default function App() {
           saving={saving}
           error={error}
           activeRoot={activeRoot}
+          git={openFileGit}
           viewer={viewer}
           tablePageSize={prefs.tablePageSize}
           t={t}
@@ -1103,6 +1211,10 @@ export default function App() {
           onViewerMode={changeViewerMode}
           onTablePageSize={(size) => persistPrefs({ tablePageSize: size })}
           onLink={onLink}
+          diff={diff}
+          onOpenDiff={() => openFile && openDiff(openFile.path)}
+          onCloseDiff={closeDiff}
+          onRefreshDiff={() => diff && loadDiffRef.current(diff.path)}
         />
       </div>
 

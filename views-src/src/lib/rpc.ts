@@ -9,6 +9,35 @@
 import type { ProjectWorkspace } from "./roots";
 import type { T } from "../i18n";
 
+/**
+ * 一行要显示的 git 状态（0.7.0）。文件上是它自己的状态，目录上是整个子树的
+ * 汇总（changed = 子树里受影响的文件数）。没有变化 / 这里没有 git 时整列为 null。
+ *
+ * status 的取值刻意与 git 的两列状态分开：porcelain 的 XY 组合有十几种，界面
+ * 只需要「这行发生了什么」这一种说法，其余细节（暂存没暂存、是不是全新文件）
+ * 放在 staged / untracked 两个布尔里。
+ */
+export type GitStatusKind =
+  | "added"
+  | "modified"
+  | "deleted"
+  | "renamed"
+  | "conflicted"
+  | "typechange";
+
+export type GitEntryStatus = {
+  status: GitStatusKind;
+  /** 暂存区里也有这份改动（git 的 X 列）。 */
+  staged: boolean;
+  /** 全新文件、git 还不认识（porcelain 的 ??）。 */
+  untracked: boolean;
+  /** 相对 HEAD 的增删行数；未跟踪文件没有（git 不知道它以前长什么样）。 */
+  added: number;
+  deleted: number;
+  /** 只有目录才有：这个子树里受影响的文件数。 */
+  changed?: number;
+};
+
 export type FileEntry = {
   name: string;
   path: string;
@@ -19,7 +48,62 @@ export type FileEntry = {
   isSymlink: boolean;
   /** 符号链接指向根目录之外：不展开、不可读。 */
   outside: boolean;
+  /** git 状态徽标；没有变化就是 null（不是 absent，形状是固定的）。 */
+  git: GitEntryStatus | null;
 };
+
+/** 列表响应里那句「多少处改动」；没有 git / 不是仓库时 available 为 false。 */
+export type GitSummary = {
+  available: boolean;
+  branch?: string | null;
+  counts?: { modified: number; added: number; deleted: number; renamed: number; conflicted: number };
+  total?: number;
+  /** 变化太多，状态输出被截断了：徽标可能不全。 */
+  truncated?: boolean;
+};
+
+export type DiffLine = {
+  type: "add" | "del" | "ctx" | "note";
+  text: string;
+  oldLine: number | null;
+  newLine: number | null;
+};
+
+export type DiffHunk = {
+  header: string;
+  /** @@ 头后面那段上下文（git 放的是所在函数名）。 */
+  section: string;
+  oldStart: number;
+  newStart: number;
+  lines: DiffLine[];
+};
+
+export type DiffSection = {
+  /** worktree = 暂存区 → 工作区；staged = HEAD → 暂存区。 */
+  scope: "worktree" | "staged";
+  /** diff --git / new file mode 这类文件头信息。 */
+  meta: string[];
+  hunks: DiffHunk[];
+  binary: boolean;
+  truncated?: boolean;
+};
+
+export type GitDiffResponse =
+  | {
+      ok: true;
+      path: string;
+      /** none = 这个文件没有改动；binary / tooLarge 另有说明。 */
+      kind: "text" | "none" | "binary" | "tooLarge";
+      untracked: boolean;
+      addedLines: number;
+      deletedLines: number;
+      sections: DiffSection[];
+      truncated: boolean;
+      status?: GitEntryStatus | null;
+      limit?: number;
+      size?: number;
+    }
+  | Failure;
 
 export type Failure = { ok: false; code: string; message: string };
 
@@ -74,6 +158,8 @@ export type ListResponse = {
   truncated: boolean;
   /** 项目里存在生效的忽略规则；false 表示「无规则，全部展示」。 */
   ignoreActive: boolean;
+  /** 整个工作区的改动概览（供头部那一句用）；没有 git 时 available 为 false。 */
+  git: GitSummary;
 };
 
 export type TextRead = {
@@ -85,6 +171,8 @@ export type TextRead = {
   bom: boolean;
   size: number;
   mtimeMs: number;
+  /** 这个文件相对 HEAD 的 git 状态（0.7.0）；没有变化或这里没有 git 时是 null。 */
+  git: GitEntryStatus | null;
 };
 
 /**
@@ -274,6 +362,7 @@ export const channels = {
   sqliteOpen: "fm.sqlite.open",
   sqliteRows: "fm.sqlite.rows",
   sqliteQuery: "fm.sqlite.query",
+  gitDiff: "fm.git.diff",
 } as const;
 
 /** 把失败响应统一成人话，供 UI 直接展示。 */
@@ -317,6 +406,8 @@ export function failureMessage(failure: Failure, t: T): string {
       return t("sqliteNoSuchObject");
     case "SQLITE_OFFSET_LIMIT":
       return t("sqliteOffsetLimit");
+    case "GIT_UNAVAILABLE":
+      return t("gitUnavailable");
     default:
       // SQLITE_SQL_ERROR 走这里：引擎自己的报错（no such table: …）就是最有用的文案
       return failure.message || failure.code;

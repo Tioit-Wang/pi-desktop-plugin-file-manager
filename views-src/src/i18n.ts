@@ -5,7 +5,9 @@
 
 export type Locale = "en" | "zh";
 
-const COPY = {
+/** 导出：verify-git.mjs 要断言中英两套文案键一一对齐（少一个中文键，界面上会突然
+ *  冒出一句英文，而 tsc 抓不到）。 */
+export const COPY_TABLES = {
   en: {
     title: "File Manager",
     projectFiles: "Project files",
@@ -156,6 +158,32 @@ const COPY = {
     errNotFound: "That path no longer exists.",
     errUnsupported: "This host does not support that operation.",
     errNoBridge: "This page must be opened inside PI-Desktop.",
+    changes: "Changes",
+    viewChanges: "View changes",
+    backToEditor: "Back to the file",
+    gitUnavailable: "Git status is unavailable here (no git, or this folder is not a repository).",
+    gitAdded: "Added",
+    gitModified: "Modified",
+    gitDeleted: "Deleted",
+    gitRenamed: "Renamed",
+    gitConflicted: "Conflicted",
+    gitTypechange: "Type changed",
+    gitUntracked: "untracked",
+    gitStaged: "staged",
+    gitChangedFiles: "{count} files in this folder",
+    gitCountModified: "{count} modified",
+    gitCountAdded: "{count} added",
+    gitCountDeleted: "{count} deleted",
+    gitCountRenamed: "{count} renamed",
+    gitCountConflicted: "{count} conflicted",
+    gitClean: "no local changes",
+    gitTruncated: "partial (too many changes)",
+    gitNoChanges: "This file matches the last commit — no changes to show.",
+    gitDiffBinary: "This file is binary, so there is nothing to diff line by line.",
+    gitDiffTooLarge: "This file is {size}; its new contents are not shown (limit {limit}).",
+    gitDiffTruncated: "output truncated",
+    gitScopeStaged: "Staged (HEAD → index)",
+    gitScopeWorktree: "Working tree (index → disk)",
   },
   zh: {
     title: "文件管理器",
@@ -305,15 +333,44 @@ const COPY = {
     errNotFound: "该路径已不存在。",
     errUnsupported: "当前宿主不支持该操作。",
     errNoBridge: "本页面需要在 PI-Desktop 中打开。",
+    changes: "变更",
+    viewChanges: "查看变更",
+    backToEditor: "回到文件",
+    gitUnavailable: "这里拿不到 git 状态（没有 git，或这个文件夹不是仓库）。",
+    gitAdded: "新增",
+    gitModified: "已修改",
+    gitDeleted: "已删除",
+    gitRenamed: "已重命名",
+    gitConflicted: "冲突",
+    gitTypechange: "类型变更",
+    gitUntracked: "未纳入版本控制",
+    gitStaged: "已暂存",
+    gitChangedFiles: "本文件夹内 {count} 个文件有变化",
+    gitCountModified: "{count} 个已修改",
+    gitCountAdded: "{count} 个新增",
+    gitCountDeleted: "{count} 个已删除",
+    gitCountRenamed: "{count} 个已重命名",
+    gitCountConflicted: "{count} 个冲突",
+    gitClean: "工作区干净",
+    gitTruncated: "变化过多，只显示了一部分",
+    gitNoChanges: "这个文件与上次提交一致，没有可显示的变更。",
+    gitDiffBinary: "二进制文件，没有可逐行对照的变更。",
+    gitDiffTooLarge: "这个文件有 {size}，不显示其内容变更（上限 {limit}）。",
+    gitDiffTruncated: "输出已截断",
+    gitScopeStaged: "已暂存（HEAD → 暂存区）",
+    gitScopeWorktree: "工作区（暂存区 → 磁盘）",
   },
 } as const;
 
-export type CopyKey = keyof (typeof COPY)["en"];
+export type CopyKey = keyof (typeof COPY_TABLES)["en"];
 
 export function makeT(locale: Locale) {
   return (key: CopyKey, values: Record<string, string | number> = {}): string => {
-    const table = COPY[locale] ?? COPY.en;
-    const text: string = (table as Record<string, string>)[key] ?? (COPY.en as Record<string, string>)[key] ?? key;
+    const table = COPY_TABLES[locale] ?? COPY_TABLES.en;
+    const text: string =
+      (table as Record<string, string>)[key] ??
+      (COPY_TABLES.en as Record<string, string>)[key] ??
+      key;
     return text.replace(/\{(\w+)\}/g, (_, name: string) => String(values[name] ?? ""));
   };
 }
