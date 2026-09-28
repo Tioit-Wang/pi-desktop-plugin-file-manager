@@ -321,7 +321,7 @@ input:focus-visible {
 }
 
 .md-body {
-  max-width: 78ch;
+  max-width: 100%;
   color: var(--fg);
   font-size: 13px;
   line-height: 1.7;
