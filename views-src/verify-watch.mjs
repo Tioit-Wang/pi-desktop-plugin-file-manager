@@ -58,6 +58,14 @@ check("没记过的路径不算自己写的", internals.isSelfWrite("unit/only-h
 internals.noteSelfWrite("unit/only-here.ts");
 check("刚记过的路径算自己写的", internals.isSelfWrite("unit/only-here.ts") === true);
 check("别的路径不受影响", internals.isSelfWrite("unit/other.ts") === false);
+// 目录项事件：Windows 的递归监听在写文件时，会额外给「它所在的每一层目录」各报一次
+// `change <目录>`（见 main.js noteSelfWrite 的注释）。这些目录事件必须同样算「自己写的」，
+// 否则每按一次 Ctrl+S 还是会被其中一条判成外部改动。
+internals.noteSelfWrite("deep/nested/x.ts");
+check("写过的文件所在目录算自己写的", internals.isSelfWrite("deep/nested") === true);
+check("更上层祖先目录也算（每一层都会报）", internals.isSelfWrite("deep") === true);
+check("不相干的目录仍不算", internals.isSelfWrite("other") === false);
+check("根路径不因写文件被记（根自身不发目录事件）", internals.isSelfWrite("") === false);
 
 // ── 2. 端到端：真的 fs.watch + 真的 main.js ─────────────────────────────────
 
@@ -107,6 +115,29 @@ async function drain(before, timeoutMs = 3000) {
   }
 }
 
+/**
+ * 静默到「连着两轮都没有新变化」为止，返回稳定的游标。
+ *
+ * 需要的理由：操作系统的事件可能比「谁引起它」晚到（上一段的外部新建 / 删除就会），那些
+ * 迟到的目录事件属于**上一段**，不该被算进下面这一次操作里——否则断言会随机红一次。
+ */
+async function settle(from, timeoutMs = 4000) {
+  const deadline = Date.now() + timeoutMs;
+  let cursor = from;
+  let quiet = 0;
+  while (quiet < 2 && Date.now() < deadline) {
+    await sleep(internals.WATCH_DEBOUNCE_MS * 2);
+    const response = await onPanelInvoke("fm.watch", { since: cursor });
+    if (response.changed.length === 0) {
+      quiet += 1;
+    } else {
+      quiet = 0;
+      cursor = response.revision;
+    }
+  }
+  return cursor;
+}
+
 try {
   const hello = await onPanelInvoke("fm.hello", {});
   check("hello 说这个运行时能监听", hello.watch?.available === true, JSON.stringify(hello.watch));
@@ -153,7 +184,9 @@ try {
   );
 
   // 本插件自己的写：不能被当成外部改动（否则每按一次 Ctrl+S 就重装一次文档）
-  cursor = noise.revision;
+  // 迟到的目录事件属于上一段（外部新建 / 删除），先静稳再取游标：否则上一段那条
+  // `change src` 会随机落进下面这一次保存的窗口里，让这条断言变成「偶尔红一次」。
+  cursor = await settle(noise.revision);
   const read = await onPanelInvoke("fm.read", { path: "src/a.ts" });
   const saved = await onPanelInvoke("fm.write", {
     path: "src/a.ts",
@@ -178,6 +211,31 @@ try {
   writeFileSync(join(project, "src", "a.ts"), "one\ntwo\nthree\nfour\n");
   const later = await drain(cursor);
   check("抑制窗口过后，同名改动照旧上报（监听不会慢慢失灵）", later.seen.has("src/a.ts"), [...later.seen].join("|"));
+
+  // 嵌套目录里的文件：祖先目录的 `change <目录>` 事件也要被抑制掉，不能只按文件路径抑制。
+  // 在这一段之前已经空转过 SELF_WRITE_SUPPRESS_MS，所以上一笔 fm.write 的抑制窗口早就过期了，
+  // 这里报出来的任何东西都只可能来自这一次保存（上游目录事件同样会按「自己写的」处理）。
+  cursor = later.cursor;
+  mkdirSync(join(project, "src", "deep"), { recursive: true });
+  writeFileSync(join(project, "src", "deep", "nested.ts"), "nested one\n");
+  const quietCursor = await settle(cursor); // 外部创建的事件先流干净（含迟到的目录事件）
+  const nestedRead = await onPanelInvoke("fm.read", { path: "src/deep/nested.ts" });
+  const nestedSave = await onPanelInvoke("fm.write", {
+    path: "src/deep/nested.ts",
+    text: "nested one\nnested two\n",
+    expectedMtimeMs: nestedRead.mtimeMs,
+    expectedSize: nestedRead.size,
+    eol: "lf",
+    bom: false,
+  });
+  check("嵌套文件的写入成功", nestedSave.ok === true, JSON.stringify(nestedSave));
+  await sleep(internals.WATCH_DEBOUNCE_MS * 4);
+  const afterNestedSave = await onPanelInvoke("fm.watch", { since: quietCursor });
+  check(
+    "嵌套文件保存后，连祖先目录的目录项事件也不进增量",
+    afterNestedSave.changed.length === 0,
+    JSON.stringify(afterNestedSave.changed),
+  );
 
   // 换基点：监听跟着换
   const other = join(root, "other");

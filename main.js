@@ -1378,10 +1378,23 @@ function isSelfWrite(rel) {
   return true;
 }
 
-/** 本插件自己动了这个路径：接下来这一小段时间里它引起的事件不算「外部改动」。 */
+/**
+ * 本插件自己动了这个路径：接下来这一小段时间里它引起的事件不算「外部改动」。
+ *
+ * 除了这个路径，还要把它**每一层祖先目录**一起记上：Windows 的递归监听在我们写一个
+ * 文件时，会额外给「它所在的每一层目录」各报一次 `change <目录>`——文件名是给了的，
+ * 只是名字是目录而不是文件（实测：写 `src/deep/x.ts` 会报 `change src/deep` 与
+ * `change src`）。这几笔不记下来，自己按一次 Ctrl+S 就会被这些多余的目录事件判成
+ * 「外部改动」，刚保存的文档被重装一遍——正是这一节要防的事。根目录自身不发这种
+ * 目录事件（实测），所以只记到最外层目录为止。
+ */
 function noteSelfWrite(rel) {
   if (!rel) return;
-  selfWrites.set(rel, Date.now());
+  const stamp = Date.now();
+  selfWrites.set(rel, stamp);
+  for (let cut = rel.lastIndexOf("/"); cut > 0; cut = rel.lastIndexOf("/", cut - 1)) {
+    selfWrites.set(rel.slice(0, cut), stamp);
+  }
   if (selfWrites.size > WATCH_SELF_WRITE_CACHE_LIMIT) {
     const now = Date.now();
     for (const [key, at] of selfWrites) {
