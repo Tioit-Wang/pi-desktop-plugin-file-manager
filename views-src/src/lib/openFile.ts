@@ -11,7 +11,7 @@
  * 不变式由 verify-viewers.mjs 断言。
  */
 
-import type { ReadResponse, SqliteInfo } from "./rpc";
+import type { GitEntryStatus, ReadResponse, SqliteInfo } from "./rpc";
 
 export type OpenFileKind = "text" | "binary" | "image" | "media" | "tooLarge" | "sqlite";
 
@@ -26,6 +26,12 @@ export type OpenFile = {
   /** 图片 / 音视频：主进程读好的 data URI（面板是 file://，拿不到真实路径）。 */
   dataUri?: string;
   mime?: string;
+  /**
+   * 这个文件相对 HEAD 的 git 状态（0.7.0）。它决定右侧有没有「变更」可看：
+   * 宿主请求打开文件时左侧列表是收起的，那时树里没有这一行可查。
+   * 树里的徽标由 fm.list 给，两处都是主进程现算的同一份快照。
+   */
+  git?: GitEntryStatus | null;
   /** 仅 tooLarge：该类型的体积上限，用来把提示写具体。 */
   limit?: number;
   /** 仅 sqlite：头部概览，以及宿主运行时是否带 node:sqlite。 */
@@ -38,9 +44,11 @@ export type OpenFile = {
 export function toOpenFile(response: ReadResponse, loadToken: number): OpenFile {
   const base = { path: response.path, size: response.size, mtimeMs: response.mtimeMs, loadToken };
   const empty = { text: "", eol: "lf" as const, bom: false };
+  // 只有文本能看差异；其余形态带过去也只是白占一个字段。
+  const git = response.kind === "text" ? (response.git ?? null) : null;
 
   if (response.kind === "text") {
-    return { ...base, kind: "text", text: response.text, eol: response.eol, bom: response.bom };
+    return { ...base, kind: "text", text: response.text, eol: response.eol, bom: response.bom, git };
   }
   if (response.kind === "image" || response.kind === "media") {
     return { ...base, ...empty, kind: response.kind, mime: response.mime, dataUri: response.dataUri };

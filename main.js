@@ -29,6 +29,9 @@
  *      同一时刻**只认一个** root 作为包含基点——当前选中的那个（记忆在
  *      prefs.projectRoots，按 projectId 记忆、缺 projectId 时按主根路径）。基点
  *      绝不放大成「整个组的并集」：换基点只是换一扇门，门后的规则一条不变。
+ *   ⑨ git 联动（0.7.0）：状态与差异来自工作区里真实存在的 git（只读子命令
+ *      status / diff / rev-parse，见下面「git 状态」一节），不是自己解析 .git/**。
+ *      git 缺失 / 非仓库 / 超时都只是「没有状态」，绝不牵连列目录与读写。
  *
  * 通道：视图 window.pluginBridge.invoke("fm.*", payload) → onPanelInvoke。
  *   宿主对自定义通道的转发超时是 30s（plugin-runtime.ts PLUGIN_PANEL_TIMEOUT_MS），
@@ -128,6 +131,11 @@ let prefs = {
   /** 左侧文件列表是否收起；宿主请求打开文件时视图会强制收起并持久化。 */
   treeCollapsed: false,
   showIgnored: false,
+  /**
+   * 监听外部改动并自动刷新（0.8.0）。默认开；用户可以随时关掉回到「只手动刷新」。
+   * 主进程那边的 fs.watch 与视图的轮询都跟着这个偏好走。
+   */
+  watchFiles: true,
   mdPreview: false,
   csvTable: true,
   jsonTree: false,
@@ -676,6 +684,822 @@ async function audit(entry) {
   }
 }
 
+// ── git 状态（0.7.0） ───────────────────────────────────────────────────────
+//
+// 文件列表里的「已修改 / 新增」标记，以及单个文件到底改了什么。
+//
+// 状态**不是自己解析 .git/** 得来的，而是跑工作区里真实存在的 git（只读子命令
+// status / diff / rev-parse）。两条理由：
+//   ① 索引格式（v2/v3/v4、扩展块、稀疏索引）、工作树状态、rename 检测、
+//      .gitattributes 的 filters 与换行归一化，都要复刻一遍。自己算出来的状态
+//      迟早和 git 对不上——而「和 git 对不上」正是这个功能的全部价值所在。
+//   ② 插件进程跑在宿主给的最小环境里（child-process-env.ts 只放行 PATH 等少量
+//      变量），git 就在 PATH 上，spawn 得到；状态也因此跟着用户的 git 版本走。
+//
+// 边界：
+//   · 只跑只读子命令，从不传会写索引 / 联网的开关。GIT_OPTIONAL_LOCKS=0 让
+//     status 不为了刷新索引去抢 .git/index.lock；GIT_TERMINAL_PROMPT=0 保证任何
+//     意外的交互都变成一次立即失败，而不是把面板挂住。
+//   · 每个子命令都有超时（5s）与输出上限，超了直接 kill。面板通道的总预算是 30s，
+//     一次列表最多再叠一层 2s 的结果缓存。
+//   · 路径仍然先过 resolveInsideRoot（根内包含 + 凭据黑名单）；传给 git 的是
+//     **根相对**路径，并配 GIT_LITERAL_PATHSPECS=1——文件名里带 ":(top)" 之类
+//     也不会被当成 pathspec 魔法。git 在这里只是被问了一句「这些文件怎么样」。
+//   · git 缺失 / 当前文件夹不是仓库 / 超时 / 任何意外，都只是「没有状态」：
+//     全部降级成 null，绝不影响列目录与读写。
+//   · 子模块只看指针本身变没变（--ignore-submodules=none），不递归进子模块工作区。
+
+const GIT_TIMEOUT_MS = 5000;
+/** 同一 root 的结果缓存：一次展开目录往往连带好几次列表调用。 */
+const GIT_SNAPSHOT_TTL_MS = 2000;
+const MAX_STATUS_BYTES = 8 * 1024 * 1024;
+const MAX_DIFF_BYTES = 1024 * 1024;
+/** 未跟踪文件的「全文都是新增」是自己读出来的，单独一个更紧的上限。 */
+const MAX_UNTRACKED_DIFF_BYTES = 256 * 1024;
+const MAX_DIFF_LINES = 20000;
+/** PATH 里没有 git 时的兜底（Windows 上 git 常不在 PATH 的前半段）。 */
+const GIT_FALLBACK_BINARIES = [
+  "/usr/bin/git",
+  "/usr/local/bin/git",
+  "/opt/homebrew/bin/git",
+  "/opt/local/bin/git",
+  "C:\\Program Files\\Git\\cmd\\git.exe",
+  "C:\\Program Files\\Git\\bin\\git.exe",
+];
+
+/** 状态严重度：目录汇总时取子树里最值得注意的那个（冲突 > 新增 > 删除 > …）。 */
+const GIT_STATUS_RANK = {
+  typechange: 1,
+  modified: 2,
+  renamed: 3,
+  deleted: 4,
+  added: 5,
+  conflicted: 6,
+};
+
+let gitSpawn = null;
+/**
+ * 惰性拿 child_process.spawn：万一这个运行时不给（非 Node 宿主、被裁剪的构建），
+ * 整个功能静默降级成「没有状态」，列目录照旧。
+ */
+function gitSpawnFn() {
+  if (gitSpawn === null) {
+    try {
+      gitSpawn = require("node:child_process").spawn;
+    } catch {
+      gitSpawn = false;
+    }
+  }
+  return gitSpawn || null;
+}
+
+/** 探测成功的 git 可执行文件；null = 还没试过。 */
+let gitBinary = null;
+
+function runGit(rootPath, binary, args, { maxBytes, timeoutMs = GIT_TIMEOUT_MS } = {}) {
+  const spawn = gitSpawnFn();
+  if (!spawn) return Promise.reject(fail("GIT_UNAVAILABLE", "child processes are unavailable"));
+  return new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = spawn(binary, args, {
+        cwd: rootPath,
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          // 只读三件套：别抢索引锁、别开分页器、别弹交互提示。
+          GIT_OPTIONAL_LOCKS: "0",
+          GIT_PAGER: "cat",
+          GIT_TERMINAL_PROMPT: "0",
+          // 文件名里的 pathspec 魔法一律当普通字符。
+          GIT_LITERAL_PATHSPECS: "1",
+          LC_ALL: "C",
+        },
+      });
+    } catch (error) {
+      reject(error);
+      return;
+    }
+
+    const chunks = [];
+    let size = 0;
+    let truncated = false;
+    let timedOut = false;
+    let stderr = "";
+    let settled = false;
+
+    const finish = (settle, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      settle(value);
+    };
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, timeoutMs);
+
+    child.stdout?.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > maxBytes) {
+        // 超量就掐掉：面板里没人看得完 8 MiB 的状态，掐掉还少占内存。
+        truncated = true;
+        child.kill("SIGKILL");
+        return;
+      }
+      chunks.push(chunk);
+    });
+    child.stderr?.on("data", (chunk) => {
+      if (stderr.length < 2048) stderr += chunk.toString("utf8");
+    });
+    child.on("error", (error) => finish(reject, error));
+    child.on("close", (code) => {
+      finish(resolve, {
+        code: code ?? 0,
+        stdout: Buffer.concat(chunks),
+        truncated,
+        timedOut,
+        stderr,
+      });
+    });
+  });
+}
+
+/**
+ * 跑一条 git 命令。第一次用 PATH 里的 `git`；ENOENT 就按常见安装位置挨个试，
+ * 找到就记住（每个插件进程一次）。
+ */
+async function runGitCommand(rootPath, args, options = {}) {
+  const candidates = gitBinary ? [gitBinary] : ["git", ...GIT_FALLBACK_BINARIES];
+  for (const binary of candidates) {
+    let result;
+    try {
+      result = await runGit(rootPath, binary, args, options);
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      throw error;
+    }
+    gitBinary = binary;
+    return result;
+  }
+  throw fail("GIT_UNAVAILABLE", "git was not found on PATH");
+}
+
+/**
+ * `git status --porcelain=v1 -z` 的解析。两列状态 + 一个路径，NUL 分隔；重命名 /
+ * 复制是**两条**记录：先「新路径」（带 XY 两列），紧跟一条只有原路径的裸记录。
+ */
+function parsePorcelainV1(stdout) {
+  const records = [];
+  const fields = stdout.toString("utf8").split("\0");
+  for (let index = 0; index < fields.length; index += 1) {
+    const field = fields[index];
+    // 空字段是结尾的 NUL；长度不足或第三位不是空格的都是裸路径（重命名的原路径）。
+    if (!field || field.length < 4 || field[2] !== " ") continue;
+    const x = field[0];
+    const y = field[1];
+    const renamed = x === "R" || x === "C";
+    const origPath = renamed ? fields[index + 1] ?? "" : null;
+    if (renamed) index += 1;
+    records.push({ x, y, path: field.slice(3), origPath });
+  }
+  return records;
+}
+
+/** 两列状态 → 一个用来显示的状态 + 「暂存区里也有没有」+「是不是全新文件」。 */
+function classifyRecord(record) {
+  const { x, y } = record;
+  if (x === "?" || y === "?") return { status: "added", staged: false, untracked: true };
+  if (x === "U" || y === "U" || (x === "A" && y === "A") || (x === "D" && y === "D")) {
+    return { status: "conflicted", staged: true, untracked: false };
+  }
+  if (x === "R" || x === "C") return { status: "renamed", staged: true, untracked: false };
+  if (x === "A") return { status: "added", staged: true, untracked: false };
+  if (x === "D") return { status: "deleted", staged: true, untracked: false };
+  if (y === "D") return { status: "deleted", staged: false, untracked: false };
+  if (x === "T" || y === "T") return { status: "typechange", staged: x === "T", untracked: false };
+  if (x === "M" || y === "M") return { status: "modified", staged: x === "M", untracked: false };
+  return null;
+}
+
+/**
+ * `git diff --numstat -z` 的解析：每条 `+行数\t-行数\t路径`，二进制是 `-\t-`。
+ * 重命名在 -z 下是 `+行\t-行\t`（路径留空）后面跟两条裸路径，原路径在前、新路径在后。
+ */
+function parseNumstat(stdout) {
+  const stats = new Map();
+  const fields = stdout.toString("utf8").split("\0");
+  for (let index = 0; index < fields.length; index += 1) {
+    const field = fields[index];
+    if (!field) continue;
+    const first = field.indexOf("\t");
+    const second = first < 0 ? -1 : field.indexOf("\t", first + 1);
+    if (second < 0) continue;
+    const added = field.slice(0, first);
+    const deleted = field.slice(first + 1, second);
+    let filePath = field.slice(second + 1);
+    if (!filePath) {
+      // 重命名：紧跟的两条裸路径是 (原, 新)，统计挂在新路径上。
+      filePath = fields[index + 2] ?? "";
+      index += 2;
+      if (!filePath) continue;
+    }
+    stats.set(filePath, {
+      added: added === "-" ? 0 : Number(added) || 0,
+      deleted: deleted === "-" ? 0 : Number(deleted) || 0,
+      binary: added === "-" && deleted === "-",
+    });
+  }
+  return stats;
+}
+
+/**
+ * HEAD → 工作区的增删行数。一次 diff 就覆盖了「已暂存 + 未暂存」两层。
+ * 仓库还没有任何提交（unborn HEAD）时 HEAD 不存在，退回「暂存区」与「工作区」
+ * 两份再合并。
+ */
+async function gitNumstat(rootPath) {
+  const options = { maxBytes: MAX_STATUS_BYTES };
+  const head = await runGitCommand(rootPath, ["diff", "--numstat", "-z", "HEAD", "--"], options);
+  if (head && head.code === 0) return parseNumstat(head.stdout);
+  const [staged, worktree] = await Promise.all([
+    runGitCommand(rootPath, ["diff", "--numstat", "-z", "--cached", "--"], options),
+    runGitCommand(rootPath, ["diff", "--numstat", "-z", "--"], options),
+  ]);
+  const merged = new Map();
+  for (const result of [staged, worktree]) {
+    if (!result || result.code !== 0) continue;
+    for (const [filePath, value] of parseNumstat(result.stdout)) merged.set(filePath, value);
+  }
+  return merged;
+}
+
+/**
+ * 一次快照：这个工作区相对当前基点 root 的状态。
+ *
+ * files 的键是**根相对**路径（git 报的路径相对仓库根，而当前基点可能在仓库的
+ * 子目录里，所以先减掉 `rev-parse --show-prefix` 给的前缀）；值是这一行要显示的
+ * 状态与增删行数。快照为 null = 这里没有可用的状态（非仓库 / 没有 git / 出错）。
+ */
+async function buildGitSnapshot(rootPath) {
+  const probe = await runGitCommand(rootPath, ["rev-parse", "--show-toplevel", "--show-prefix"], {
+    maxBytes: 4096,
+  });
+  if (!probe || probe.code !== 0) return null;
+  const probeLines = probe.stdout.toString("utf8").split("\n");
+  if (!probeLines[0]) return null;
+  const prefix = (probeLines[1] ?? "").trim();
+
+  const [status, stats, branchResult] = await Promise.all([
+    runGitCommand(
+      rootPath,
+      [
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+        "--ignore-submodules=none",
+      ],
+      { maxBytes: MAX_STATUS_BYTES },
+    ),
+    gitNumstat(rootPath),
+    runGitCommand(rootPath, ["rev-parse", "--abbrev-ref", "HEAD"], { maxBytes: 4096 }).catch(
+      () => null,
+    ),
+  ]);
+  if (!status || status.code !== 0) return null;
+
+  const files = new Map();
+  for (const record of parsePorcelainV1(status.stdout)) {
+    if (prefix && !record.path.startsWith(prefix)) continue;
+    const rel = prefix ? record.path.slice(prefix.length) : record.path;
+    if (!rel) continue;
+    const classified = classifyRecord(record);
+    if (!classified) continue;
+    const stat = stats.get(record.path);
+    files.set(rel, {
+      ...classified,
+      added: stat?.added ?? 0,
+      deleted: stat?.deleted ?? 0,
+      // 未跟踪的文件没有 numstat（git 不知道它以前长什么样），行数留给差异视图去数。
+      binary: Boolean(stat?.binary),
+    });
+  }
+
+  return {
+    rootPath,
+    files,
+    truncated: status.truncated,
+    // unborn 仓库与游离 HEAD 都报 "HEAD"，那不是分支名。
+    branch: branchResult?.code === 0 ? branchResult.stdout.toString("utf8").trim() : null,
+  };
+}
+
+/** rootPath → { at, snapshot }；同一个 root 的并发请求共用一次 git。 */
+let gitCache = new Map();
+
+/** 本插件自己改过文件之后立刻作废缓存：状态必须跟着这次保存走。 */
+function invalidateGitSnapshots() {
+  gitCache = new Map();
+}
+
+async function gitSnapshotFor(rootPath) {
+  const cached = gitCache.get(rootPath);
+  if (cached?.pending) return cached.pending;
+  if (cached && Date.now() - cached.at < GIT_SNAPSHOT_TTL_MS) return cached.snapshot;
+
+  const pending = buildGitSnapshot(rootPath)
+    // 快照失败只等于「没有状态」：绝不让它把列目录 / 打开文件带崩。
+    .catch(() => null)
+    .then((snapshot) => {
+      gitCache.set(rootPath, { at: Date.now(), snapshot });
+      return snapshot;
+    });
+  gitCache.set(rootPath, { at: cached?.at ?? 0, snapshot: cached?.snapshot ?? null, pending });
+  return pending;
+}
+
+/**
+ * 把子树里的变化汇总到直接子目录上：列目录时每个子目录要一个徽标，不能对每个
+ * 目录都重扫一遍全部变化（3000 个条目 × 几万条变化会卡住面板）。这里只把每条
+ * 变化归到它**第一段**路径上，一次遍历就够。
+ */
+function rollupByChildDirectory(snapshot, rel) {
+  const prefix = rel ? `${rel}/` : "";
+  const groups = new Map();
+  for (const [filePath, info] of snapshot.files) {
+    if (prefix && !filePath.startsWith(prefix)) continue;
+    const rest = filePath.slice(prefix.length);
+    const slash = rest.indexOf("/");
+    if (slash < 0) continue; // 直接子文件：它自己那行有状态
+    const name = rest.slice(0, slash);
+    const current = groups.get(name);
+    if (!current) {
+      groups.set(name, { ...info, changed: 1 });
+      continue;
+    }
+    current.changed += 1;
+    current.added += info.added;
+    current.deleted += info.deleted;
+    current.staged = current.staged || info.staged;
+    current.untracked = current.untracked || info.untracked;
+    if ((GIT_STATUS_RANK[info.status] ?? 0) > (GIT_STATUS_RANK[current.status] ?? 0)) {
+      current.status = info.status;
+    }
+  }
+  // 目录的徽标只显示状态与合计行数，binary 是单文件才有的细节。
+  for (const group of groups.values()) delete group.binary;
+  return groups;
+}
+
+/** 列表响应里那一句「多少处改动」：只算当前基点这个 root 里的变化。 */
+function summarizeGit(snapshot) {
+  const counts = { modified: 0, added: 0, deleted: 0, renamed: 0, conflicted: 0 };
+  let total = 0;
+  for (const info of snapshot.files.values()) {
+    if (info.status in counts) counts[info.status] += 1;
+    total += 1;
+  }
+  return {
+    available: true,
+    branch: snapshot.branch,
+    counts,
+    total,
+    truncated: snapshot.truncated,
+  };
+}
+
+/** 打开一个文件时问一句「它有没有改动」：列表收起时右侧也要有「变更」可看。 */
+async function gitInfoFor(abs, rel) {
+  if (!rel) return null;
+  const root = await currentRoot();
+  // 项目外（宿主自选的会话临时文件 / 附件）没有根内基点，与 git 无关。
+  if (!root || !isInside(root.path, abs)) return null;
+  const snapshot = await gitSnapshotFor(root.path);
+  return snapshot?.files.get(rel) ?? null;
+}
+
+/**
+ * unified diff → 可直接渲染的段落。返回行类型（add/del/ctx）而不是原始文本，
+ * 视图不必再解析一遍，也就能在这里单测。
+ */
+function parseUnifiedDiff(text) {
+  const meta = [];
+  const hunks = [];
+  let binary = false;
+  let hunk = null;
+  let oldLine = 0;
+  let newLine = 0;
+
+  const rawLines = text.split("\n");
+  // git 的输出以换行收尾：split 出来的最后一个空串不是一行内容，丢掉它，
+  // 否则每个文件末尾都会多出一行「空白的上下文」。
+  if (rawLines.length > 0 && rawLines[rawLines.length - 1] === "") rawLines.pop();
+  for (const line of rawLines) {
+    if (line.startsWith("@@")) {
+      const match = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/.exec(line);
+      if (!match) {
+        hunk = null;
+        continue;
+      }
+      oldLine = Number(match[1]);
+      newLine = Number(match[3]);
+      hunk = {
+        header: line,
+        section: (match[5] ?? "").trim(),
+        oldStart: oldLine,
+        newStart: newLine,
+        lines: [],
+      };
+      hunks.push(hunk);
+      continue;
+    }
+    if (!hunk) {
+      // hunk 之前是文件头：diff --git / index / 模式变化 / 二进制提示。
+      if (line.startsWith("Binary files") || line.startsWith("GIT binary patch")) binary = true;
+      else if (line) meta.push(line);
+      continue;
+    }
+    if (line.startsWith("+")) {
+      hunk.lines.push({ type: "add", text: line.slice(1), oldLine: null, newLine });
+      newLine += 1;
+    } else if (line.startsWith("-")) {
+      hunk.lines.push({ type: "del", text: line.slice(1), oldLine, newLine: null });
+      oldLine += 1;
+    } else if (line.startsWith("\\")) {
+      hunk.lines.push({ type: "note", text: line.slice(1).trim(), oldLine: null, newLine: null });
+    } else {
+      hunk.lines.push({ type: "ctx", text: line.slice(1), oldLine, newLine });
+      oldLine += 1;
+      newLine += 1;
+    }
+  }
+  return { meta, hunks, binary };
+}
+
+/**
+ * 未跟踪文件的内容全是新增，git 自己不给差异（`--no-index` 还得造一个 /dev/null，
+ * 跨平台不牢靠）。这里直接读文件、每行加前缀，语义与 git 的「新文件」一致。
+ */
+function untrackedDiff(text, truncated) {
+  const lines = text.split("\n");
+  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  const kept = lines.slice(0, MAX_DIFF_LINES);
+  return {
+    meta: ["--- /dev/null", truncated ? "+++ (truncated new file)" : "+++ (new file)"],
+    binary: false,
+    hunks: [
+      {
+        header: `@@ -0,0 +1,${kept.length} @@`,
+        section: "",
+        oldStart: 0,
+        newStart: 1,
+        lines: kept.map((line, index) => ({
+          type: "add",
+          text: line,
+          oldLine: null,
+          newLine: index + 1,
+        })),
+      },
+    ],
+  };
+}
+
+/**
+ * 一个文件到底改了什么。已跟踪文件同时看「暂存区 → 工作区」与「HEAD → 暂存区」
+ * 两段：只有一段有内容就只给这一段，两段都有就都列出来（标题写清楚哪来的）。
+ */
+async function handleGitDiff(payload) {
+  // 一次解析就够：包含校验、凭据黑名单、基点都在 resolveInsideRoot 里。
+  const { rootPath, abs, rel } = await resolveInsideRoot(payload?.path ?? "");
+  if (!rel) throw fail("INVALID_PATH", "the project root has no changes to show");
+  const snapshot = await gitSnapshotFor(rootPath);
+  if (!snapshot) throw fail("GIT_UNAVAILABLE", "git status is unavailable in this folder");
+
+  const info = snapshot.files.get(rel) ?? null;
+
+  if (info?.untracked) {
+    const stat = await fs.stat(abs).catch(() => null);
+    if (!stat?.isFile()) throw fail("NOT_FOUND", "file not found");
+    if (stat.size > MAX_UNTRACKED_DIFF_BYTES) {
+      return {
+        ok: true,
+        path: rel,
+        kind: "tooLarge",
+        untracked: true,
+        limit: MAX_UNTRACKED_DIFF_BYTES,
+        size: stat.size,
+        addedLines: 0,
+        deletedLines: 0,
+        sections: [],
+        truncated: true,
+      };
+    }
+    const buffer = await fs.readFile(abs);
+    // 含 NUL 字节 = 二进制：逐行加前缀毫无意义，直接说清楚。
+    if (buffer.subarray(0, 4096).includes(0)) {
+      return {
+        ok: true,
+        path: rel,
+        kind: "binary",
+        untracked: true,
+        addedLines: 0,
+        deletedLines: 0,
+        sections: [],
+        truncated: false,
+      };
+    }
+    const parsed = untrackedDiff(buffer.toString("utf8"), buffer.length >= MAX_UNTRACKED_DIFF_BYTES);
+    return {
+      ok: true,
+      path: rel,
+      kind: "text",
+      untracked: true,
+      addedLines: parsed.hunks[0].lines.length,
+      deletedLines: 0,
+      sections: [{ scope: "worktree", ...parsed }],
+      truncated: buffer.length >= MAX_UNTRACKED_DIFF_BYTES,
+    };
+  }
+
+  const diffArgs = ["diff", "--no-color", "--no-ext-diff", "-U3", "--", rel];
+  const [worktree, staged] = await Promise.all([
+    runGitCommand(rootPath, diffArgs, { maxBytes: MAX_DIFF_BYTES }),
+    runGitCommand(
+      rootPath,
+      ["diff", "--no-color", "--no-ext-diff", "-U3", "--cached", "--", rel],
+      { maxBytes: MAX_DIFF_BYTES },
+    ),
+  ]);
+  if (!worktree || worktree.code !== 0) {
+    throw fail("GIT_UNAVAILABLE", worktree?.stderr?.trim() || "git diff failed");
+  }
+
+  const sections = [];
+  let addedLines = 0;
+  let deletedLines = 0;
+  // 整个响应的行数预算：超了就把后面的 hunk 丢掉并说清楚「已截断」——界面上那句
+  // 「输出已截断」必须名副其实，否则用户会以为差异就这么多。
+  let budget = MAX_DIFF_LINES;
+  let truncated = false;
+
+  for (const [scope, result] of [
+    ["worktree", worktree],
+    ["staged", staged],
+  ]) {
+    if (!result || result.code !== 0 || result.stdout.length === 0) continue;
+    const parsed = parseUnifiedDiff(result.stdout.toString("utf8"));
+    if (parsed.hunks.length === 0 && !parsed.binary) continue;
+
+    if (parsed.binary) {
+      sections.push({ scope, meta: parsed.meta, hunks: [], binary: true, truncated: false });
+      continue;
+    }
+
+    const hunks = [];
+    for (const hunk of parsed.hunks) {
+      if (budget <= 0) {
+        truncated = true;
+        break;
+      }
+      const lines = hunk.lines.slice(0, budget);
+      budget -= lines.length;
+      if (lines.length < hunk.lines.length) truncated = true;
+      for (const line of lines) {
+        if (line.type === "add") addedLines += 1;
+        else if (line.type === "del") deletedLines += 1;
+      }
+      hunks.push({ ...hunk, lines });
+    }
+    sections.push({
+      scope,
+      meta: parsed.meta,
+      hunks,
+      binary: false,
+      truncated: truncated || result.truncated,
+    });
+  }
+
+  return {
+    ok: true,
+    path: rel,
+    kind:
+      sections.length === 0
+        ? "none"
+        : sections.some((section) => section.binary)
+          ? "binary"
+          : "text",
+    untracked: false,
+    status: info,
+    addedLines,
+    deletedLines,
+    sections,
+    truncated,
+  };
+}
+
+// ── 文件监听（0.8.0） ───────────────────────────────────────────────────────
+//
+// 「文件在编辑器之外被改了」这条链路以前只能靠用户点刷新。现在主进程用 Node 的
+// fs.watch 盯着**当前基点 root**（递归），把变化去抖成一串根相对路径，视图低频
+// 轮询取走。为什么是「主进程 watch + 视图轮询」而不是别的形状：
+//   · 宿主没有给插件「向视图推送」的通道（pi 上只有 ui.showToast / notify 这类
+//     单向通知），视图只能自己来取；那就让主进程做监听、视图只取游标增量，
+//     免得视图每秒在整棵树上 stat 一遍。
+//   · fs.watch 是操作系统的原生通知（macOS FSEvents / Windows
+//     ReadDirectoryChangesW / Linux inotify），比轮询便宜得多，也不占通道预算。
+//
+// 三件必须做对的事：
+//   ① **不把自己的写当成外部改动**：保存走的是「临时文件 + rename」，监听一定会
+//     报。照单全收的话，用户每按一次 Ctrl+S 就会把自己的文档重新装载一遍（光标
+//     与滚动位置一起丢）。所以本插件每次写盘 / 新建 / 改名 / 移动 / 删除都先记一笔
+//     （noteSelfWrite），这一笔在 SELF_WRITE_SUPPRESS_MS 内到达的事件被丢掉。
+//   ② **不盯噪声**：.git/ 与 node_modules/ 的变化量极大且与本视图无关；凭据类路径
+//     （.env* / .ssh / *.pem…）照旧不报——监听不是绕过黑名单的后门。
+//   ③ **不丢事件、也不无限增长**：去抖窗口内的事件合并成一次；增量历史有界，
+//     视图拿着很旧的游标回来时只可能拿到「最近这些」，它据此做的是保守刷新，
+//     不会因为少看到一次就出错。
+
+const WATCH_DEBOUNCE_MS = 250;
+const WATCH_HISTORY_LIMIT = 400;
+/** 本插件自己的写在这段时间内到达的同名事件被忽略。 */
+const SELF_WRITE_SUPPRESS_MS = 1500;
+const WATCH_SELF_WRITE_CACHE_LIMIT = 200;
+/** 一次轮询最多报多少条变化（再多，视图「刷新所在目录」已经覆盖到了）。 */
+const WATCH_MAX_CHANGED = 200;
+
+let watchSupported = true;
+let watcher = null;
+let watchRevision = 0;
+/** 增量历史：{ revision, path }，超过上限丢最旧的。 */
+let watchHistory = [];
+/** 去抖窗口里收到的事件（路径去重）。 */
+let watchPending = new Set();
+let watchTimer = null;
+/** 根相对路径 → 本插件自己写它的时间戳。 */
+const selfWrites = new Map();
+
+let fsWatch = null;
+/**
+ * 惰性拿 fs.watch：万一这个运行时不给（非 Node 宿主、被裁剪的构建），功能静默
+ * 降级成「只有手动刷新」，与 git 缺失是同一种降级方式。
+ */
+function fsWatchFn() {
+  if (fsWatch === null) {
+    try {
+      fsWatch = require("node:fs").watch;
+    } catch {
+      fsWatch = false;
+    }
+  }
+  return fsWatch || null;
+}
+
+/** 噪声与不该看的东西：.git / node_modules / 凭据路径 / 本插件的临时文件。 */
+function isWatchIgnored(rel) {
+  if (!rel) return false;
+  // 任意一层出现 .git / node_modules 都跳（只看第一段会漏掉嵌套的依赖目录）。
+  if (rel.split("/").some((segment) => segment === ".git" || segment === "node_modules")) return true;
+  // 原子写的临时文件：`.README.md.1730abcd.ef12.tmp`（见 atomicWrite）。
+  if (/^\..+\.[a-z0-9]+\.[a-z0-9]+\.tmp$/i.test(rel.split("/").pop() ?? "")) return true;
+  return isDenied(rel, "read");
+}
+
+/** 本插件自己写下的这个路径刚被监听到了？ */
+function isSelfWrite(rel) {
+  const at = selfWrites.get(rel);
+  if (at === undefined) return false;
+  if (Date.now() - at > SELF_WRITE_SUPPRESS_MS) {
+    selfWrites.delete(rel);
+    return false;
+  }
+  return true;
+}
+
+/** 本插件自己动了这个路径：接下来这一小段时间里它引起的事件不算「外部改动」。 */
+function noteSelfWrite(rel) {
+  if (!rel) return;
+  selfWrites.set(rel, Date.now());
+  if (selfWrites.size > WATCH_SELF_WRITE_CACHE_LIMIT) {
+    const now = Date.now();
+    for (const [key, at] of selfWrites) {
+      if (now - at > SELF_WRITE_SUPPRESS_MS) selfWrites.delete(key);
+    }
+  }
+}
+
+function flushWatchChanges() {
+  if (watchTimer) {
+    clearTimeout(watchTimer);
+    watchTimer = null;
+  }
+  if (watchPending.size === 0) return;
+  const batch = [...watchPending];
+  watchPending = new Set();
+  for (const rel of batch) {
+    if (isSelfWrite(rel)) continue;
+    watchRevision += 1;
+    watchHistory.push({ revision: watchRevision, path: rel });
+  }
+  if (watchHistory.length > WATCH_HISTORY_LIMIT) {
+    watchHistory = watchHistory.slice(-WATCH_HISTORY_LIMIT);
+  }
+  // 磁盘变了，git 状态与增删行数也就变了：快照当场作废，下一次列表 / 差异现算。
+  invalidateGitSnapshots();
+}
+
+function noteWatchChange(rel) {
+  watchPending.add(rel);
+  if (watchTimer) clearTimeout(watchTimer);
+  watchTimer = setTimeout(flushWatchChanges, WATCH_DEBOUNCE_MS);
+}
+
+function stopWatching() {
+  if (watchTimer) {
+    clearTimeout(watchTimer);
+    watchTimer = null;
+  }
+  watchPending = new Set();
+  if (watcher) {
+    try {
+      watcher.close();
+    } catch {
+      /* 已经关掉了 */
+    }
+    watcher = null;
+  }
+}
+
+/** 对着基点 root 开一只递归监听。同一时刻只有一只——换基点就是换监听对象。 */
+function startWatching(rootPath) {
+  if (watcher?.rootPath === rootPath) return true;
+  stopWatching();
+  const watch = fsWatchFn();
+  if (!watch) {
+    watchSupported = false;
+    return false;
+  }
+  try {
+    const handle = watch(
+      rootPath,
+      // persistent: false —— 监听不该让插件进程一直活着；没有变化时它可以自然退出。
+      { recursive: true, persistent: false },
+      (_eventType, filename) => {
+        // 有些平台不提供文件名：那就只知道「根底下有东西变了」，把根本身报出去，
+        // 视图据此刷新当前目录——宁可多刷一次，也不要漏掉一次。
+        if (!filename) {
+          noteWatchChange("");
+          return;
+        }
+        const rel = String(filename).replace(/\\/g, "/");
+        if (isWatchIgnored(rel)) return;
+        noteWatchChange(rel);
+      },
+    );
+    handle.on("error", () => {
+      // 监听器自己出错了（例如根目录被删了）：退回手动刷新，不把错误抛给任何通道。
+      stopWatching();
+      watchSupported = false;
+    });
+    watcher = { rootPath, close: () => handle.close() };
+    return true;
+  } catch {
+    // 老平台不支持 recursive watch：不假装能用，让视图把自动刷新关掉。
+    watchSupported = false;
+    return false;
+  }
+}
+
+/**
+ * 视图的轮询：拿「上次游标之后变了哪些路径」。
+ *
+ * 顺带做两件事——基点换了就换监听；去抖窗口快到点时把这一批现在就发出去（否则用户
+ * 会多等一个去抖周期才看到刷新）。
+ */
+async function handleWatch(payload) {
+  const root = await currentRoot();
+  if (!root) return { ok: true, available: false, revision: watchRevision, changed: [] };
+
+  if (watchSupported) startWatching(root.path);
+  flushWatchChanges();
+
+  const since = Number.isFinite(payload?.since) ? Number(payload.since) : 0;
+  const changed = watchHistory
+    .filter((entry) => entry.revision > since)
+    .map((entry) => entry.path);
+
+  return {
+    ok: true,
+    available: watchSupported && watcher !== null,
+    revision: watchRevision,
+    changed: changed.slice(0, WATCH_MAX_CHANGED),
+    // 游标已经落到有界历史之外：视图据此也按「可能还有别的变化」做一次保守刷新。
+    stale: since > 0 && watchHistory.length > 0 && since < watchHistory[0].revision,
+  };
+}
+
 // ── 读 ──────────────────────────────────────────────────────────────────────
 
 async function handleList(payload) {
@@ -751,12 +1575,25 @@ async function handleList(payload) {
     return left.name.localeCompare(right.name, undefined, { numeric: true, sensitivity: "base" });
   });
 
+  // git 状态：整个工作区一次算完（2s 缓存），文件各取各的，目录取子树的汇总。
+  // 非仓库 / 没有 git 时 snapshot 为 null，整列就是 null——树照旧，只是没有徽标。
+  const snapshot = await gitSnapshotFor(rootPath);
+  const gitGroups = snapshot ? rollupByChildDirectory(snapshot, rel) : new Map();
+  for (const entry of entries) {
+    entry.git = snapshot
+      ? entry.isDirectory
+        ? gitGroups.get(entry.name) ?? null
+        : snapshot.files.get(entry.path) ?? null
+      : null;
+  }
+
   return {
     ok: true,
     path: rel,
     entries,
     truncated,
     ignoreActive: rules.length > 0,
+    git: snapshot ? summarizeGit(snapshot) : { available: false },
   };
 }
 
@@ -771,8 +1608,14 @@ async function handleRead(payload) {
   const stat = await fs.stat(abs).catch(() => null);
   if (!stat) throw fail("NOT_FOUND", "file not found");
   if (stat.isDirectory()) throw fail("INVALID_PATH", "path is a directory");
-
-  const base = { path: rel, size: stat.size, mtimeMs: stat.mtimeMs };
+  // 打开文件时也问一句 git：这个文件有没有改动。左侧列表收起时（宿主请求打开就会
+  // 收起）树里没有这一行，右侧的「变更」入口不能跟着一起消失。
+  const base = {
+    path: rel,
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    git: await gitInfoFor(abs, rel),
+  };
   const extension = path.extname(rel).toLowerCase();
 
   // 数据库：只读 100 字节的头部就能认出它，所以这一支**不做体积限制**——
@@ -911,6 +1754,12 @@ async function handleWrite(payload) {
     bytes: Buffer.byteLength(serialized, "utf8"),
     result: "ok",
   });
+  // 刚落盘的内容就是「工作区相对 HEAD 的改动」：状态缓存必须立刻作废，
+  // 否则树里的徽标与右侧的差异要等 2s 之后才跟上。
+  invalidateGitSnapshots();
+  // 监听（0.8.0）会把「临时文件 + rename」报成一次外部改动；记一笔，视图就不会
+  // 因为用户自己按的 Ctrl+S 而把文档重新装载一遍（那会丢光标与滚动位置）。
+  noteSelfWrite(rel);
 
   return { ok: true, mtimeMs: next.mtimeMs, size: next.size };
 }
@@ -922,15 +1771,20 @@ const WINDOWS_RESERVED = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
 function assertValidName(rawName) {
   if (typeof rawName !== "string") throw fail("INVALID_NAME", "name is required");
   const name = rawName.trim();
-  if (!name) throw fail("INVALID_NAME", "name is required");
-  if (name === "." || name === "..") throw fail("INVALID_NAME", "invalid name");
-  if (/[\\/:*?"<>|]/.test(name)) throw fail("INVALID_NAME", "name contains an illegal character");
-  if (WINDOWS_RESERVED.test(name)) throw fail("INVALID_NAME", "name is reserved by the system");
-  if (name.length > 200) throw fail("INVALID_NAME", "name is too long");
-  return name;
-}
-
 function entryFromStat(name, rel, stat) {
+  return {
+    name,
+    path: rel,
+    isDirectory: stat.isDirectory(),
+    size: stat.isDirectory() ? undefined : stat.size,
+    mtimeMs: stat.mtimeMs,
+    ignored: false,
+    isSymlink: false,
+    outside: false,
+    // 新建 / 改名 / 移动之后这一行是全新的：状态由下一次列表调用现算。
+    git: null,
+  };
+}
   return {
     name,
     path: rel,
@@ -957,6 +1811,8 @@ async function handleCreate(payload) {
   else await fs.writeFile(childAbs, "", { flag: "wx" });
 
   await audit({ api: "fm.create", path: childRel, result: "ok" });
+  invalidateGitSnapshots(); // 新文件立刻就该有「新增」徽标。
+  noteSelfWrite(childRel); // 监听别把这当成「外部新建」。
   return { ok: true, entry: entryFromStat(name, childRel, await fs.stat(childAbs)) };
 }
 
@@ -974,6 +1830,9 @@ async function handleRename(payload) {
 
   await fs.rename(source.abs, nextAbs);
   await audit({ api: "fm.rename", path: `${source.rel} → ${nextRel}`, result: "ok" });
+  invalidateGitSnapshots();
+  noteSelfWrite(source.rel);
+  noteSelfWrite(nextRel);
   return { ok: true, entry: entryFromStat(name, nextRel, await fs.stat(nextAbs)) };
 }
 
@@ -1007,6 +1866,9 @@ async function handleMove(payload) {
   }
 
   await audit({ api: "fm.move", path: `${source.rel} → ${nextRel}`, result: "ok" });
+  invalidateGitSnapshots();
+  noteSelfWrite(source.rel);
+  noteSelfWrite(nextRel);
   return { ok: true, entry: entryFromStat(name, nextRel, await fs.stat(nextAbs)) };
 }
 
@@ -1033,6 +1895,8 @@ async function handleDelete(payload) {
   await fs.rm(target.abs, { recursive: stat.isDirectory(), force: false });
 
   await audit({ api: "fm.delete", path: target.rel, result: "ok" });
+  invalidateGitSnapshots();
+  noteSelfWrite(target.rel);
   return { ok: true };
 }
 
@@ -1649,6 +2513,7 @@ function sanitizePrefs(partial) {
     }
     if (typeof partial.treeCollapsed === "boolean") next.treeCollapsed = partial.treeCollapsed;
     if (typeof partial.showIgnored === "boolean") next.showIgnored = partial.showIgnored;
+    if (typeof partial.watchFiles === "boolean") next.watchFiles = partial.watchFiles;
     if (typeof partial.mdPreview === "boolean") next.mdPreview = partial.mdPreview;
     if (typeof partial.csvTable === "boolean") next.csvTable = partial.csvTable;
     if (typeof partial.jsonTree === "boolean") next.jsonTree = partial.jsonTree;
@@ -1711,6 +2576,9 @@ async function handleHello() {
       maxListEntries: MAX_LIST_ENTRIES,
     },
     ignoreFiles: IGNORE_FILE_NAMES,
+    // 这个运行时能不能监听：不能的话视图把「自动刷新」开关显示成不可用，
+    // 而不是让用户开了却永远没反应。
+    watch: { available: watchSupported && fsWatchFn() !== null },
     prefs,
   };
 }
@@ -1732,6 +2600,8 @@ const CHANNELS = {
   "fm.sqlite.open": handleSqliteOpen,
   "fm.sqlite.rows": handleSqliteRows,
   "fm.sqlite.query": handleSqliteQuery,
+  "fm.git.diff": handleGitDiff,
+  "fm.watch": handleWatch,
 };
 
 async function onPanelInvoke(channel, payload) {
@@ -1763,6 +2633,35 @@ async function onLoad() {
 async function onUnload() {
   searchSessions.clear();
   for (const key of [...sqliteHandles.keys()]) closeSqliteHandle(key);
+  invalidateGitSnapshots();
+  // 监听必须随插件一起走：漏关就是一只挂在别人项目上的眼睛（而且是 persistent 的）。
+  stopWatching();
 }
 
-module.exports = { onLoad, onUnload, onPanelInvoke };
+module.exports = {
+  onLoad,
+  onUnload,
+  onPanelInvoke,
+  // 纯解析函数：verify-git.mjs 直接拿它们单测（porcelain / numstat / unified
+  // diff 的形态很容易在 git 升级时悄悄变一次，解析必须能被断言）。
+  internals: {
+    parsePorcelainV1,
+    classifyRecord,
+    parseNumstat,
+    parseUnifiedDiff,
+    untrackedDiff,
+    rollupByChildDirectory,
+    GIT_STATUS_RANK,
+    GIT_TIMEOUT_MS,
+    GIT_SNAPSHOT_TTL_MS,
+    MAX_DIFF_LINES,
+    MAX_UNTRACKED_DIFF_BYTES,
+    // 监听（0.8.0）的纯判定：噪声过滤与自己写入的抑制，verify-watch.mjs 直接断言。
+    isWatchIgnored,
+    isSelfWrite,
+    noteSelfWrite,
+    WATCH_DEBOUNCE_MS,
+    SELF_WRITE_SUPPRESS_MS,
+    WATCH_HISTORY_LIMIT,
+  },
+};

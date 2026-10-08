@@ -25,7 +25,8 @@ async function loadModule() {
     `export * as csv from ${JSON.stringify(join(src, "csv.ts"))};\n` +
       `export * as json from ${JSON.stringify(join(src, "json.ts"))};\n` +
       `export * as viewers from ${JSON.stringify(join(src, "viewers.ts"))};\n` +
-      `export * as openFile from ${JSON.stringify(join(src, "openFile.ts"))};\n`,
+      `export * as openFile from ${JSON.stringify(join(src, "openFile.ts"))};\n` +
+      `export * as pane from ${JSON.stringify(join(src, "pane.ts"))};\n`,
   );
 
   await build({
@@ -49,7 +50,7 @@ const check = (ok, label, detail) => {
 const same = (actual, expected) => JSON.stringify(actual) === JSON.stringify(expected);
 
 const main = async () => {
-  const { csv, json, viewers, openFile } = await loadModule();
+  const { csv, json, viewers, openFile, pane } = await loadModule();
 
   console.log("--- CSV 解析 ---");
   const cases = [
@@ -265,6 +266,93 @@ const main = async () => {
     modes.every((mode) => typeof viewers.MODE_LABEL[mode] === "string"),
     "每个模式都有按钮文案（漏了会在界面上显示成 key）",
   );
+
+  // ── 内容区一次只显示一种（0.8.1：预览与「变更」重叠的回归） ──────────────
+  //
+  // 修之前的结构：「变更」是 tablist 之外的独立开关，内容区又按各自的布尔条件
+  // 各渲染各的，于是「预览开着 + 变更开着」是合法组合 → Markdown 预览与差异视图
+  // 两个整块高的视图同时挂载、压在一起。现在判定收敛到 lib/pane.ts 的一个**单值**，
+  // 这里把它钉死：任何输入组合下都只能得出一种内容视图，且页签组内互斥。
+
+  console.log("\n内容区一次只显示一种（lib/pane.ts）");
+
+  const { contentKind, tabs, activeTabKey } = pane;
+  const kinds = new Set([
+    "editor", "diff", "markdown", "table", "tree", "image", "media", "sqlite", "binary", "tooLarge",
+  ]);
+  const fileKinds = ["text", "image", "media", "sqlite", "binary", "tooLarge"];
+  const viewerModes = ["source", "markdown", "table", "tree"];
+
+  // 全组合扫描：任何输入下都只能是一种内容视图（单值本身就是保证，这里是防回归）
+  const seen = new Set();
+  let combinations = 0;
+  for (const fileKind of [null, ...fileKinds]) {
+    for (const viewerMode of viewerModes) {
+      for (const diffOpen of [false, true]) {
+        const kind = contentKind({ fileKind, viewerMode, diffOpen });
+        check(kinds.has(kind), `未知的内容视图 ${kind}`);
+        seen.add(kind);
+        combinations += 1;
+      }
+    }
+  }
+  check(
+    combinations === (fileKinds.length + 1) * viewerModes.length * 2,
+    "全组合扫描后仍是单值（每次只返回一个 kind）",
+    `${combinations} combos`,
+  );
+  check(seen.size === 10, [...seen].join(","), "十种内容视图都真的可达（没有被写死的分支）");
+
+  check(
+    contentKind({ fileKind: "text", viewerMode: "markdown", diffOpen: true }) === "diff" &&
+      contentKind({ fileKind: "text", viewerMode: "table", diffOpen: true }) === "diff" &&
+      contentKind({ fileKind: "text", viewerMode: "tree", diffOpen: true }) === "diff",
+    "变更开着时压过任何预览模式（就是那个重叠场景）",
+    contentKind({ fileKind: "text", viewerMode: "markdown", diffOpen: true }),
+  );
+  check(
+    contentKind({ fileKind: "text", viewerMode: "markdown", diffOpen: false }) === "markdown" &&
+      contentKind({ fileKind: "text", viewerMode: "table", diffOpen: false }) === "table" &&
+      contentKind({ fileKind: "text", viewerMode: "tree", diffOpen: false }) === "tree",
+    "变更关掉时预览照旧（没有把预览改没了）",
+  );
+  check(
+    contentKind({ fileKind: "text", viewerMode: "source", diffOpen: false }) === "editor",
+    "编辑态没有变更时仍然是编辑器",
+  );
+  check(
+    contentKind({ fileKind: "image", viewerMode: "source", diffOpen: false }) === "image" &&
+      contentKind({ fileKind: "media", viewerMode: "source", diffOpen: false }) === "media" &&
+      contentKind({ fileKind: "sqlite", viewerMode: "source", diffOpen: false }) === "sqlite" &&
+      contentKind({ fileKind: "binary", viewerMode: "source", diffOpen: false }) === "binary" &&
+      contentKind({ fileKind: "tooLarge", viewerMode: "source", diffOpen: false }) === "tooLarge",
+    "字节类文件各归各位（图片 / 媒体 / 数据库 / 二进制 / 过大）",
+  );
+  check(contentKind({ fileKind: null, viewerMode: "source", diffOpen: false }) === "editor", "没打开文件时是编辑器（空面板）");
+
+  // ── 页签组：编辑 / 预览 / 变更 同组，且组内唯一选中 ──────────────────────
+  console.log("\n页签组（编辑 / 预览 / 变更 同组互斥）");
+  const mdTabs = tabs({ modes: ["source", "markdown"], hasGit: true, isText: true });
+  check(mdTabs.map((tab) => tab.key).join("|") === "source|markdown|diff", mdTabs.map((tab) => tab.key).join("|"), "Markdown：编辑、预览、变更三者同组");
+  const csvTabs = tabs({ modes: ["source", "table"], hasGit: true, isText: true });
+  check(csvTabs.map((tab) => tab.key).join("|") === "source|table|diff", "CSV：表格也进同一组");
+  check(tabs({ modes: null, hasGit: true, isText: true }).map((tab) => tab.key).join("|") === "source|diff", "纯文本文件：至少有一个可点的页签");
+  check(tabs({ modes: ["source", "markdown"], hasGit: false, isText: true }).map((tab) => tab.key).join("|") === "source|markdown", "没有变化时不给变更页签");
+  check(tabs({ modes: null, hasGit: true, isText: false }).map((tab) => tab.key).join("|") === "source", "非文本文件不给变更页签（逐行差异对它没意义）");
+  check(new Set(mdTabs.map((tab) => tab.key)).size === mdTabs.length, "页签 key 不重复（重复会让 React 复用出怪东西）");
+  check(mdTabs.at(-1)?.status === "git", "变更页签带 git 状态（徽标要用）");
+
+  for (const mode of viewerModes) {
+    for (const diffOpen of [false, true]) {
+      const active = activeTabKey({ diffOpen, mode });
+      const keys = tabs({ modes: ["source", mode], hasGit: true, isText: true }).map((tab) => tab.key);
+      check(
+        keys.includes(active) && keys.filter((key) => key === active).length === 1,
+        `选中项 ${active} 一定在本组内且唯一（mode=${mode} diff=${diffOpen}）`,
+        `${active} vs ${keys.join("|")}`,
+      );
+    }
+  }
 
   console.log(`\n${failures === 0 ? "VIEWERS VERIFY PASSED" : `${failures} FAILURE(S)`}`);
   process.exit(failures === 0 ? 0 : 1);

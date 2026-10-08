@@ -26,6 +26,13 @@
   --json-string: #98c379;
   --json-number: #d19a66;
   --json-literal: #c678dd;
+  /* git 状态徽标（0.7.0）。刻意与 --danger 那套语义色分开：删除不是错误，
+     红只是「这一类变化」的约定，扫一眼要能把新增 / 修改 / 删除分清。 */
+  --git-added: #3fb950;
+  --git-modified: #d29922;
+  --git-deleted: #f85149;
+  --git-renamed: #58a6ff;
+  --git-conflicted: #bc8cff;
   --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
 }
 
@@ -50,6 +57,11 @@
   --json-string: #50a14f;
   --json-number: #986801;
   --json-literal: #a626a4;
+  --git-added: #1a7f37;
+  --git-modified: #9a6700;
+  --git-deleted: #cf222e;
+  --git-renamed: #0969da;
+  --git-conflicted: #8250df;
 }
 
 /* Tailwind preflight 已关闭，这里给出最小必要的基础样式。 */
@@ -291,6 +303,116 @@ input:focus-visible {
 .tree-row[data-selected="true"] .tree-size,
 .tree-row[data-selected="true"] .tree-mark {
   color: color-mix(in oklab, var(--fg) 70%, transparent);
+}
+
+/* git 状态徽标（0.7.0）。一个字母 + 颜色：先扫颜色分出「哪一类变化」，再要细节
+   时看行尾的 +N/−N 或 tooltip。目录上额外带一个受影响文件数。 */
+.git-badge {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  min-width: 13px;
+  height: 13px;
+  padding: 0 3px;
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0;
+  color: var(--git-added);
+  background: color-mix(in oklab, currentColor 16%, transparent);
+}
+
+.git-badge-count {
+  margin-left: 2px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.git-stats {
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: 3px;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.git-stats .git-add {
+  color: var(--git-added);
+}
+
+.git-stats .git-del {
+  color: var(--git-deleted);
+}
+
+/* 差异视图：hunk 头 + 带双侧行号的对照行。整块用等宽字体，行高固定，横向滚动。 */
+.diff-hunk {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  white-space: pre;
+  min-width: max-content;
+}
+
+.diff-hunk-head {
+  padding: 2px 8px;
+  color: var(--faint);
+  background: var(--surface-raised);
+  border-top: 1px solid var(--border);
+}
+
+.diff-line {
+  display: flex;
+  align-items: baseline;
+}
+
+.diff-num {
+  flex: 0 0 auto;
+  width: 34px;
+  padding-right: 6px;
+  text-align: right;
+  color: var(--faint);
+  user-select: none;
+  font-variant-numeric: tabular-nums;
+}
+
+.diff-sign {
+  flex: 0 0 auto;
+  width: 12px;
+  text-align: center;
+  user-select: none;
+  color: var(--muted);
+}
+
+.diff-text {
+  flex: 1 0 auto;
+  padding-right: 12px;
+}
+
+.diff-line-add {
+  background: color-mix(in oklab, var(--git-added) 14%, transparent);
+}
+
+.diff-line-add .diff-sign,
+.diff-line-add .diff-text {
+  color: var(--git-added);
+}
+
+.diff-line-del {
+  background: color-mix(in oklab, var(--git-deleted) 14%, transparent);
+}
+
+.diff-line-del .diff-sign,
+.diff-line-del .diff-text {
+  color: var(--git-deleted);
+}
+
+.diff-line-note {
+  color: var(--faint);
+  font-style: italic;
 }
 
 /* 选中行的图标保留满色，普通行略降，选中因此更「亮」。 */

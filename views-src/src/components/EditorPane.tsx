@@ -1,11 +1,12 @@
  import { useCallback, useEffect, useRef, useState } from "react";
 import { createEditor, type EditorHandle } from "../lib/editor";
 import type { Base } from "../lib/appearance";
-import type { T } from "../i18n";
+import type { CopyKey, T } from "../i18n";
 import { baseNameOf, formatSize, formatTime } from "../lib/format";
 import { FileIcon } from "../lib/fileIcons";
 import { MarkdownPreview } from "../lib/markdown";
 import { MODE_LABEL, csvDelimiterOf, type ViewerMode, type ViewerView } from "../lib/viewers";
+import { activeTabKey, contentKind, tabs as paneTabs } from "../lib/pane";
 import { isDocumentLoaded, type OpenFile } from "../lib/openFile";
  import { invoke } from "../lib/bridge";
  import { absolutePathOf } from "../lib/roots";
@@ -15,6 +16,9 @@ import { ImageView } from "./ImageView";
 import { JsonTree } from "./JsonTree";
 import { MediaPlayer } from "./MediaPlayer";
 import { SqliteView } from "./SqliteView";
+import { gitColor, gitGlyph, gitTitle } from "../lib/git";
+import type { GitEntryStatus, GitStatusKind } from "../lib/rpc";
+import { GitDiffView, type DiffViewState } from "./GitDiffView";
 
 type Props = {
   file: OpenFile | null;
@@ -27,7 +31,17 @@ type Props = {
   viewer: ViewerView | null;
   /** 表格每页行数（偏好里记着）。 */
   tablePageSize: number;
+  /**
+   * 打开的文件在外部被改动、而缓冲里还有未保存的改动（0.8.0）。
+   * 这种情况下**不自动装载**（会丢掉用户刚敲的字），只亮一条提示。
+   */
+  externalChange: boolean;
    activeRoot: WorkspaceRoot | null;
+  /**
+   * 当前文件的 git 状态（0.7.0）。为 null 时工具栏就没有「变更」入口。
+   * App 负责算（读文件时带回来的那份，或树里的徽标），这里只管摆出来。
+   */
+  git: GitEntryStatus | null;
    t: T;
   handleRef: React.MutableRefObject<EditorHandle | null>;
   onDirty: () => void;
@@ -36,7 +50,18 @@ type Props = {
   onViewerMode: (mode: ViewerMode) => void;
   onTablePageSize: (size: number) => void;
   onLink: (url: string) => void;
+  /**
+   * git 差异（0.7.0）。state 为 null = 没打开差异视图；path 与当前文件不一致时
+   * 也不显示（用户已经切到别的文件去了，那份差异不该跟着串场）。
+   */
+  diff: (DiffViewState & { path: string }) | null;
+  onOpenDiff: () => void;
+  onCloseDiff: () => void;
+  onRefreshDiff: () => void;
 };
+
+/** 页签文案。「变更」复用已有的 changes 键，不新增同义词。 */
+const TAB_LABEL: Record<string, CopyKey> = { ...MODE_LABEL, diff: "changes" };
 
 export function EditorPane({
   file,
@@ -48,6 +73,8 @@ export function EditorPane({
   error,
   viewer,
   tablePageSize,
+  externalChange,
+  git,
   t,
   handleRef,
   onDirty,
@@ -56,6 +83,10 @@ export function EditorPane({
   onViewerMode,
   onTablePageSize,
   onLink,
+  diff,
+  onOpenDiff,
+  onCloseDiff,
+  onRefreshDiff,
 }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   // 编辑器里装的是哪一次「从磁盘读进来」的内容；null = 还没装。
@@ -161,17 +192,39 @@ export function EditorPane({
   // 改完再切过去必须看到刚写的内容。文件刚换、上面的 effect 还没跑时，
   // handle 里装的仍是上一个文件，此时退回 file.text（保存后它也是最新的）。
   const mode = viewer?.mode ?? "source";
-  const structured = Boolean(file && viewer && mode !== "source");
   const imageSrc = file?.kind === "image" ? file.dataUri : undefined;
   const mediaSrc = file?.kind === "media" ? file.dataUri : undefined;
   const sqlite = file?.kind === "sqlite" ? file.sqlite : undefined;
-  const editorHidden = structured || Boolean(imageSrc) || Boolean(mediaSrc) || Boolean(sqlite);
+  // 差异视图与图片 / 媒体 / 数据库一样，是「占住整个内容区」的一种形态：编辑器
+  // 必须藏起来（CodeMirror 在 display:none 的容器里量不到尺寸）。
+  const diffOpen = Boolean(file && diff && diff.path === file.path);
+  // 内容区显示哪一种，由 lib/pane.ts 一处说了算（单值，所以不可能同时挂两种）。
+  const content = contentKind({ fileKind: file?.kind ?? null, viewerMode: mode, diffOpen });
+  const editorHidden = content !== "editor";
+  /**
+   * 页签只有一组：**编辑 / 预览（表格、树）/ 变更**。
+   *
+   * 「变更」必须在这组里，不能另做一个开关按钮——它是「同一份文件换一种看法」，
+   * 与编辑、预览互斥。放在组外（0.7.0 的做法）时「预览」与「变更」可以同时成立，
+   * 内容区就会把 Markdown 预览与差异视图一起挂上去：两个都是整块高的视图，于是
+   * 互相压在一起（0.8.1 修掉的那个重叠）。互斥放在这一层，就没机会同时成立。
+   *
+   * 变更只对文本文件给出：图片 / 音视频 / 数据库各自占住整个内容区，再插一页签
+   * 只会让人以为切过去能看到逐行差异。
+   */
+  const paneTabList = paneTabs({
+    modes: viewer?.modes ?? null,
+    hasGit: Boolean(git),
+    isText: file?.kind === "text",
+  });
+  const activeTab = activeTabKey({ diffOpen, mode });
 
   const liveText =
     isDocumentLoaded(file, loadedToken) && file
       ? handleRef.current?.text() ?? file.text
       : file?.text ?? "";
-  const structuredText = structured ? liveText : "";
+  // 内容区现在不是编辑器时，预览/表格/树渲染的是「编辑器里当前那份文本」。
+  const structuredText = content === "editor" ? "" : liveText;
 
   // 预览或查看器占位时编辑器必须藏起来、且要 false 掉 CodeMirror 的测量：
   // 它在 display:none 的容器里量不到尺寸，回到编辑态会排版错乱。
@@ -220,29 +273,47 @@ export function EditorPane({
               </span>
             ) : null}
 
-            {viewer ? (
+            {/* 编辑 / 预览 / 变更 是一组互斥页签。切到编辑或预览就是「关掉变更」，
+                所以从任何一侧点进去都能再点回来，不会出现「预览还开着、差异又叠上来」。 */}
+            {paneTabList.length > 0 ? (
               <div
                 role="tablist"
                 aria-label={t("viewMode")}
                 className="flex flex-none items-center gap-0.5 rounded-md p-0.5"
                 style={{ background: "var(--surface-hover)" }}
               >
-                {viewer.modes.map((candidate) => {
-                  const active = viewer.mode === candidate;
+                {paneTabList.map((tab) => {
+                  const active = activeTab === tab.key;
+                  const isDiff = tab.key === "diff";
                   return (
                     <button
-                      key={candidate}
+                      key={tab.key}
                       type="button"
                       role="tab"
                       aria-selected={active}
-                      onClick={() => onViewerMode(candidate)}
-                      className="rounded border-0 px-2 py-[3px] text-[11px] transition-colors"
+                      title={isDiff && git ? gitTitle(git, t) : TAB_LABEL[tab.key]}
+                      onClick={() => {
+                        if (isDiff) onOpenDiff();
+                        else {
+                          onCloseDiff();
+                          onViewerMode(tab.key as ViewerMode);
+                        }
+                      }}
+                      className="flex items-center gap-1 rounded border-0 px-2 py-[3px] text-[11px] transition-colors"
                       style={{
                         background: active ? "var(--accent)" : "transparent",
                         color: active ? "var(--bg)" : "var(--secondary)",
                       }}
                     >
-                      {t(MODE_LABEL[candidate])}
+                      {isDiff && git ? (
+                        <span
+                          className="git-badge"
+                          style={{ color: active ? "var(--bg)" : gitColor(git.status) }}
+                        >
+                          {gitGlyph(git.status)}
+                        </span>
+                      ) : null}
+                      {t(TAB_LABEL[tab.key])}
                     </button>
                   );
                 })}
@@ -284,6 +355,31 @@ export function EditorPane({
         </div>
       ) : null}
 
+      {/* 外部改动提示（0.8.0）：只有「有未保存改动」时才会出现——没改动的文件早
+          就自动重新读取了，这里无事可提示。按钮走的是既有的「重新加载」，它内部
+          已经带未保存确认框（保存 / 放弃 / 取消），所以这条横幅不重复造逻辑。 */}
+      {externalChange && file ? (
+        <div
+          className="flex flex-none items-center gap-2 px-3 py-2 text-[11.5px]"
+          role="status"
+          style={{
+            background: "color-mix(in oklab, var(--git-modified) 14%, transparent)",
+            color: "var(--fg)",
+            borderBottom: "1px solid var(--border)",
+          }}
+        >
+          <span>{t("externalChanged")}</span>
+          <button
+            type="button"
+            onClick={onReload}
+            className="rounded border-0 bg-transparent px-1 text-[11px] underline underline-offset-2"
+            style={{ color: "var(--secondary)" }}
+          >
+            {t("reload")}
+          </button>
+        </div>
+      ) : null}
+
       {readOnlyReason ? (
         <div
           className="flex flex-none items-center gap-2 px-3 py-2 text-[11.5px]"
@@ -312,7 +408,9 @@ export function EditorPane({
       <div className="relative min-h-0 flex-1 overflow-hidden">
         <div ref={hostRef} className="h-full" />
 
-        {structured && file && mode === "markdown" ? (
+        {/* 整块视图只有一个在场上：content 是单值（见 lib/pane.ts），所以这里不可能
+            出现「预览与差异叠在一起」。编辑器由 editorHidden 藏起来。 */}
+        {content === "markdown" && file ? (
           <div className="md-scroll">
             <div className="md-body">
               <MarkdownPreview text={structuredText} base={base} onLink={onLink} />
@@ -320,7 +418,7 @@ export function EditorPane({
           </div>
         ) : null}
 
-        {structured && file && mode === "table" ? (
+        {content === "table" && file ? (
           <CsvTable
             text={structuredText}
             delimiter={csvDelimiterOf(file.path) ?? ","}
@@ -330,13 +428,17 @@ export function EditorPane({
           />
         ) : null}
 
-        {structured && file && mode === "tree" ? <JsonTree text={structuredText} t={t} /> : null}
+        {content === "tree" && file ? <JsonTree text={structuredText} t={t} /> : null}
 
-        {file && imageSrc ? (
+        {content === "diff" && diff ? (
+          <GitDiffView state={diff} t={t} onClose={onCloseDiff} onRefresh={onRefreshDiff} />
+        ) : null}
+
+        {content === "image" && file && imageSrc ? (
           <ImageView key={file.path} src={imageSrc} name={baseNameOf(file.path)} size={file.size} t={t} />
         ) : null}
 
-        {file && mediaSrc ? (
+        {content === "media" && file && mediaSrc ? (
           <MediaPlayer
             key={file.path}
             src={mediaSrc}
@@ -347,7 +449,7 @@ export function EditorPane({
           />
         ) : null}
 
-        {file && sqlite ? (
+        {content === "sqlite" && file && sqlite ? (
           <SqliteView
             // 带上 loadToken：工具栏的「重新加载」会重新读一次头部，key 一变就重挂载，
             // schema 与当前页数据跟着刷新（数据库不能被编辑，所以只有这一种变化来源）

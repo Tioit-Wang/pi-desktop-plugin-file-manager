@@ -3,6 +3,7 @@ import type { FileEntry } from "../lib/rpc";
 import { FileIcon } from "../lib/fileIcons";
 import { formatSize } from "../lib/format";
 import type { T } from "../i18n";
+import { gitColor, gitGlyph, gitTitle } from "../lib/git";
 
 export type DirState = {
   loading?: boolean;
@@ -212,13 +213,14 @@ export function Tree({
             aria-expanded={entry.isDirectory ? isExpanded : undefined}
             aria-selected={isSelected}
             aria-level={row.depth + 1}
-            title={
-              entry.outside
-                ? `${entry.path} — ${t("symlinkOutside")}`
-                : entry.ignored
-                  ? `${entry.path} — ${t("ignoredBadge")}`
-                  : entry.path
-            }
+            // tooltip 把状态讲全：徽标只有一个字母，鼠标停上去才知道是未跟踪还是已暂存。
+            title={[
+              entry.path,
+              entry.outside ? t("symlinkOutside") : entry.ignored ? t("ignoredBadge") : null,
+              entry.git ? gitTitle(entry.git, t) : null,
+            ]
+              .filter(Boolean)
+              .join(" — ")}
             disabled={entry.isSymlink}
             onClick={() => activate(row)}
             onKeyDown={(event) => onKeyDown(event, index, row)}
@@ -259,6 +261,29 @@ export function Tree({
               <span aria-hidden="true" className="tree-mark">
                 ↪
               </span>
+            ) : null}
+
+            {/* git 状态：徽标（哪一类变化）+ 行尾的增删行数（改了多少）。
+                目录上是子树的汇总，所以带一个受影响文件数而不是行数。 */}
+            {entry.git ? (
+              <>
+                <span
+                  className="git-badge"
+                  style={{ color: gitColor(entry.git.status) }}
+                  title={gitTitle(entry.git, t)}
+                >
+                  {gitGlyph(entry.git.status)}
+                  {entry.isDirectory && typeof entry.git.changed === "number" ? (
+                    <span className="git-badge-count">{entry.git.changed}</span>
+                  ) : null}
+                </span>
+                {!entry.isDirectory && (entry.git.added > 0 || entry.git.deleted > 0) ? (
+                  <span className="git-stats" title={gitTitle(entry.git, t)}>
+                    {entry.git.added > 0 ? <span className="git-add">+{entry.git.added}</span> : null}
+                    {entry.git.deleted > 0 ? <span className="git-del">−{entry.git.deleted}</span> : null}
+                  </span>
+                ) : null}
+              </>
             ) : null}
 
             {entry.isDirectory ? null : (
