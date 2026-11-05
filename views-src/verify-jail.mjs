@@ -14,6 +14,7 @@
  */
 
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { deflateRawSync } from "node:zlib";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
@@ -216,6 +217,7 @@ async function main() {
   );
 
 
+
   console.log("\n8. 老宿主（不带 roots / projectId）照旧");
   workspace.path = alpha;
   workspace.roots = undefined;
@@ -225,6 +227,24 @@ async function main() {
   check("不报文件夹列表", legacy.root.roots === undefined);
   const legacyRead = await onPanelInvoke("fm.read", { path: "only-in-alpha.txt" });
   check("单根读取仍然能解析", legacyRead.ok === true);
+
+  console.log("\n9. xlsx 只读预览");
+  writeFileSync(join(alpha, "book.xlsx"), xlsxBuffer());
+  writeFileSync(join(alpha, "broken.xlsx"), Buffer.from("not a workbook"));
+  const workbook = await onPanelInvoke("fm.read", { path: "book.xlsx" });
+  check("xlsx 按文本返回，不再当成二进制", workbook.ok === true && workbook.kind === "text", JSON.stringify(workbook).slice(0, 180));
+  check(
+    "共享字符串、内联文字、数字和两张表都在",
+    typeof workbook.text === "string" &&
+      workbook.text.includes("# 明细") &&
+      workbook.text.includes("名称\t数量") &&
+      workbook.text.includes("甲\t2") &&
+      workbook.text.includes("# 汇总") &&
+      workbook.text.includes("合计"),
+    String(workbook.text).slice(0, 180),
+  );
+  const broken = await onPanelInvoke("fm.read", { path: "broken.xlsx" });
+  check("损坏的 xlsx 仍是不支持预览", broken.ok === true && broken.kind === "binary", JSON.stringify(broken).slice(0, 180));
 
   console.log(`\n${failures === 0 ? "JAIL VERIFY PASSED" : `${failures} FAILURE(S)`}`);
   process.exitCode = failures === 0 ? 0 : 1;
@@ -238,3 +258,65 @@ main()
   .finally(() => {
     rmSync(root, { recursive: true, force: true });
   });
+
+function zipStore(files) {
+  const locals = [];
+  const central = [];
+  let offset = 0;
+  for (const file of files) {
+    const name = Buffer.from(file.name);
+    const data = deflateRawSync(Buffer.from(file.text));
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(8, 8);
+    local.writeUInt32LE(data.length, 18);
+    local.writeUInt32LE(Buffer.byteLength(file.text), 22);
+    local.writeUInt16LE(name.length, 26);
+    locals.push(Buffer.concat([local, name, data]));
+    const entry = Buffer.alloc(46);
+    entry.writeUInt32LE(0x02014b50, 0);
+    entry.writeUInt16LE(20, 4);
+    entry.writeUInt16LE(20, 6);
+    entry.writeUInt16LE(8, 10);
+    entry.writeUInt32LE(data.length, 20);
+    entry.writeUInt32LE(Buffer.byteLength(file.text), 24);
+    entry.writeUInt16LE(name.length, 28);
+    entry.writeUInt32LE(offset, 42);
+    central.push(Buffer.concat([entry, name]));
+    offset += locals.at(-1).length;
+  }
+  const directory = Buffer.concat(central);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(files.length, 8);
+  eocd.writeUInt16LE(files.length, 10);
+  eocd.writeUInt32LE(directory.length, 12);
+  eocd.writeUInt32LE(offset, 16);
+  return Buffer.concat([...locals, directory, eocd]);
+}
+
+function xlsxBuffer() {
+  return zipStore([
+    {
+      name: "xl/sharedStrings.xml",
+      text: "<sst><si><t>名称</t></si><si><t>甲</t></si><si><t>合计</t></si></sst>",
+    },
+    {
+      name: "xl/worksheets/sheet1.xml",
+      text: '<worksheet><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="inlineStr"><is><t>数量</t></is></c></row><row r="2"><c r="A2" t="s"><v>1</v></c><c r="B2"><v>2</v></c></row></sheetData></worksheet>',
+    },
+    {
+      name: "xl/worksheets/sheet2.xml",
+      text: '<worksheet><sheetData><row r="1"><c r="A1" t="s"><v>2</v></c></row></sheetData></worksheet>',
+    },
+    {
+      name: "xl/workbook.xml",
+      text: '<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="明细" sheetId="1" r:id="rId1"/><sheet name="汇总" sheetId="2" r:id="rId2"/></sheets></workbook>',
+    },
+    {
+      name: "xl/_rels/workbook.xml.rels",
+      text: '<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Target="/xl/worksheets/sheet2.xml"/></Relationships>',
+    },
+  ]);
+}

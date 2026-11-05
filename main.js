@@ -2378,7 +2378,7 @@ function xlsxToDelimited(buffer) {
     const target = rel && relTargets.get(rel);
     sheets.push({
       name: decodeXml(name),
-      path: target ? `xl/${target}` : `xl/worksheets/sheet${sheets.length + 1}.xml`,
+      path: target ? normalizeSheetPath(target) : `xl/worksheets/sheet${sheets.length + 1}.xml`,
     });
   }
   if (sheets.length === 0) {
@@ -2399,7 +2399,10 @@ function xlsxToDelimited(buffer) {
       break;
     }
     const entry = byName.get(sheet.path);
-    if (!entry) continue;
+    if (!entry) {
+      truncated = true;
+      continue;
+    }
     const parsed = parseWorksheet(
       inflateZipEntry(buffer, entry).toString("utf8"),
       strings,
@@ -2530,6 +2533,13 @@ function decodeXml(value) {
 function escapeDelimited(value) {
   const text = String(value ?? "").replace(/\r\n|\r|\n/g, " ");
   return /[\t"]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function normalizeSheetPath(target) {
+  const cleaned = String(target).replace(/\\/g, "/").replace(/^\//, "");
+  if (cleaned.startsWith("xl/")) return cleaned;
+  if (cleaned.startsWith("../")) return `xl/${cleaned.replace(/^(\.\.\/)+/, "")}`;
+  return `xl/${cleaned}`;
 }
 
 
