@@ -20,7 +20,8 @@
  *   ③ 原子写：临时文件 → fsync → chmod → rename，中断不留半写文件
  *   ④ 冲突检测：mtimeMs + size 作为乐观锁，外部改动过的文件不静默覆盖
  *   ⑤ 写入审计：追加到插件数据目录 write-audit.jsonl（宿主审计不到这条路径）
- *   ⑥ 上限：文本预览 2 MiB / 图片 8 MiB / 音视频与 PDF 24 MiB / 写入 8 MiB /
+ *   ⑥ 上限：文本预览 2 MiB / 图片 8 MiB / 音视频与 PDF 24 MiB / xlsx 8 MiB /
+ *      写入 8 MiB /
  *      单目录 3000 条 / 搜索分页（二进制预览走 base64，所以单独设限）
  *   ⑦ 宿主请求打开：宿主可以要求视图打开项目之外的文件（会话临时目录 / 附件，
  *      路径由宿主自己选定）。视图带 external: true 时才放行绝对路径，这条路径
@@ -39,6 +40,7 @@
  */
 
 const fs = require("node:fs/promises");
+const zlib = require("node:zlib");
 const path = require("node:path");
 
 // ── 上限 ────────────────────────────────────────────────────────────────────
@@ -47,6 +49,11 @@ const MAX_READ_BYTES = 2 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 const MAX_MEDIA_BYTES = 24 * 1024 * 1024;
 const MAX_PDF_BYTES = 24 * 1024 * 1024;
+const MAX_XLSX_BYTES = 8 * 1024 * 1024;
+const MAX_XLSX_SHEETS = 8;
+const MAX_XLSX_ROWS = 5000;
+const MAX_XLSX_COLS = 60;
+const MAX_XLSX_CELLS = 80000;
 const MAX_WRITE_BYTES = 8 * 1024 * 1024;
 const MAX_LIST_ENTRIES = 3000;
 /** prefs.projectRoots 最多记多少个项目；超出按最久没用过的淘汰。 */
@@ -2336,6 +2343,196 @@ function asDataUri(mime, buffer) {
   return `data:${mime};base64,${buffer.toString("base64")}`;
 }
 
+/**
+ * 只读 xlsx：解 zip 里的 workbook / sharedStrings / worksheet XML，转成制表符分隔文本。
+ * 多张表用空行 + `# 表名` 隔开，现有表格视图会按文本显示。失败返回 null，调用方按二进制提示。
+ */
+function xlsxToDelimited(buffer) {
+  let entries;
+  try {
+    entries = readZipEntries(buffer);
+  } catch {
+    return null;
+  }
+  const byName = new Map(entries.map((entry) => [entry.name, entry]));
+  if (!byName.has("xl/workbook.xml")) return null;
+
+  const workbook = inflateZipEntry(buffer, byName.get("xl/workbook.xml")).toString("utf8");
+  const rels = byName.has("xl/_rels/workbook.xml.rels")
+    ? inflateZipEntry(buffer, byName.get("xl/_rels/workbook.xml.rels")).toString("utf8")
+    : "";
+  const relTargets = new Map();
+  for (const match of rels.matchAll(/Id="([^"]+)"[^>]*Target="([^"]+)"/g)) {
+    relTargets.set(match[1], match[2].replace(/^\/?xl\//, ""));
+  }
+
+  const strings = byName.has("xl/sharedStrings.xml")
+    ? parseSharedStrings(inflateZipEntry(buffer, byName.get("xl/sharedStrings.xml")).toString("utf8"))
+    : [];
+
+  const sheets = [];
+  for (const match of workbook.matchAll(/<sheet\b[^>]*>/g)) {
+    const tag = match[0];
+    const name = /name="([^"]*)"/.exec(tag)?.[1] ?? `Sheet${sheets.length + 1}`;
+    const rel = /r:id="([^"]+)"/.exec(tag)?.[1];
+    const target = rel && relTargets.get(rel);
+    sheets.push({
+      name: decodeXml(name),
+      path: target ? `xl/${target}` : `xl/worksheets/sheet${sheets.length + 1}.xml`,
+    });
+  }
+  if (sheets.length === 0) {
+    for (const entry of entries) {
+      if (/^xl\/worksheets\/sheet\d+\.xml$/.test(entry.name)) {
+        sheets.push({ name: entry.name, path: entry.name });
+      }
+    }
+  }
+
+  const blocks = [];
+  let rowsUsed = 0;
+  let cellsUsed = 0;
+  let truncated = false;
+  for (const sheet of sheets.slice(0, MAX_XLSX_SHEETS)) {
+    if (rowsUsed >= MAX_XLSX_ROWS || cellsUsed >= MAX_XLSX_CELLS) {
+      truncated = true;
+      break;
+    }
+    const entry = byName.get(sheet.path);
+    if (!entry) continue;
+    const parsed = parseWorksheet(
+      inflateZipEntry(buffer, entry).toString("utf8"),
+      strings,
+      MAX_XLSX_ROWS - rowsUsed,
+      MAX_XLSX_CELLS - cellsUsed,
+    );
+    rowsUsed += parsed.rows.length;
+    cellsUsed += parsed.cells;
+    if (parsed.truncated) truncated = true;
+    const body = parsed.rows.map((row) => row.map(escapeDelimited).join("\t")).join("\n");
+    blocks.push(sheets.length > 1 ? `# ${sheet.name}\n${body}` : body);
+  }
+  if (sheets.length > MAX_XLSX_SHEETS) truncated = true;
+  if (blocks.length === 0) return null;
+  let text = blocks.join("\n\n");
+  if (truncated) text += "\n\n# 预览已截断（最多 8 张表、5000 行、60 列）";
+  return { text };
+}
+
+function readZipEntries(buffer) {
+  let eocd = -1;
+  const min = Math.max(0, buffer.length - 22 - 65535);
+  for (let index = buffer.length - 22; index >= min; index -= 1) {
+    if (buffer.readUInt32LE(index) === 0x06054b50) {
+      eocd = index;
+      break;
+    }
+  }
+  if (eocd < 0) throw new Error("not a zip");
+  const count = buffer.readUInt16LE(eocd + 10);
+  let cursor = buffer.readUInt32LE(eocd + 16);
+  const entries = [];
+  for (let index = 0; index < count; index += 1) {
+    if (buffer.readUInt32LE(cursor) !== 0x02014b50) throw new Error("bad zip directory");
+    const method = buffer.readUInt16LE(cursor + 10);
+    const compressed = buffer.readUInt32LE(cursor + 20);
+    const nameLength = buffer.readUInt16LE(cursor + 28);
+    const extra = buffer.readUInt16LE(cursor + 30);
+    const comment = buffer.readUInt16LE(cursor + 32);
+    const local = buffer.readUInt32LE(cursor + 42);
+    const name = buffer.slice(cursor + 46, cursor + 46 + nameLength).toString("utf8");
+    entries.push({ name, method, compressed, local });
+    cursor += 46 + nameLength + extra + comment;
+  }
+  return entries;
+}
+
+function inflateZipEntry(buffer, entry) {
+  if (entry.name.includes("vbaProject")) throw new Error("macro part skipped");
+  const nameLength = buffer.readUInt16LE(entry.local + 26);
+  const extra = buffer.readUInt16LE(entry.local + 28);
+  const start = entry.local + 30 + nameLength + extra;
+  const data = buffer.subarray(start, start + entry.compressed);
+  if (entry.method === 0) return data;
+  if (entry.method === 8) return zlib.inflateRawSync(data);
+  throw new Error(`unsupported zip method ${entry.method}`);
+}
+
+function parseSharedStrings(xml) {
+  const strings = [];
+  for (const item of xml.matchAll(/<si\b[^>]*>([\s\S]*?)<\/si>/g)) {
+    const parts = [...item[1].matchAll(/<t\b[^>]*>([\s\S]*?)<\/t>/g)].map((match) => decodeXml(match[1]));
+    strings.push(parts.join(""));
+  }
+  return strings;
+}
+
+function parseWorksheet(xml, strings, rowBudget, cellBudget) {
+  const rows = [];
+  let cells = 0;
+  let truncated = false;
+  const rowMatches = [...xml.matchAll(/<row\b[^>]*>([\s\S]*?)<\/row>/g)];
+  for (const rowMatch of rowMatches) {
+    if (rows.length >= rowBudget || cells >= cellBudget) {
+      truncated = true;
+      break;
+    }
+    const row = [];
+    for (const cell of rowMatch[1].matchAll(/<c\b([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g)) {
+      const ref = /\br="([A-Z]+)\d+"/.exec(cell[1]);
+      const column = ref ? columnIndex(ref[1]) : row.length;
+      if (column >= MAX_XLSX_COLS) {
+        truncated = true;
+        continue;
+      }
+      while (row.length < column) row.push("");
+      row[column] = cellText(cell[1], cell[2] ?? "", strings);
+      cells += 1;
+      if (cells >= cellBudget) {
+        truncated = true;
+        break;
+      }
+    }
+    rows.push(row);
+  }
+  return { rows, cells, truncated };
+}
+
+function cellText(attrs, inner, strings) {
+  const type = /\bt="([^"]+)"/.exec(attrs)?.[1] ?? "";
+  if (type === "inlineStr") {
+    return [...inner.matchAll(/<t\b[^>]*>([\s\S]*?)<\/t>/g)].map((match) => decodeXml(match[1])).join("");
+  }
+  const value = /<v\b[^>]*>([\s\S]*?)<\/v>/.exec(inner)?.[1] ?? "";
+  const decoded = decodeXml(value);
+  if (type === "s") return strings[Number(decoded)] ?? "";
+  if (type === "b") return decoded === "1" ? "TRUE" : "FALSE";
+  return decoded;
+}
+
+function columnIndex(letters) {
+  let index = 0;
+  for (const char of letters) index = index * 26 + (char.charCodeAt(0) - 64);
+  return index - 1;
+}
+
+function decodeXml(value) {
+  return value
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#(\d+);/g, (_, code) => String.fromCodePoint(Number(code)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, code) => String.fromCodePoint(parseInt(code, 16)))
+    .replace(/&amp;/g, "&");
+}
+
+function escapeDelimited(value) {
+  const text = String(value ?? "").replace(/\r\n|\r|\n/g, " ");
+  return /[\t"]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+
 async function handleRead(payload) {
   const { abs, rel } = await resolveTarget(payload, "read");
 
@@ -2366,6 +2563,26 @@ async function handleRead(payload) {
         ...base,
       };
     }
+  }
+
+  // xlsx 是 zip，前 4 KiB 含 NUL，旧逻辑会把它当成「二进制、暂不支持预览」。
+  // 这里只读工作表文本（共享字符串 / 内联文字 / 数字），交给现有 CSV 表格视图。
+  // 不执行宏、不读 vbaProject.bin、不改原文件。
+  if (extension === ".xlsx") {
+    if (stat.size > MAX_XLSX_BYTES) {
+      return { ok: true, kind: "tooLarge", limit: MAX_XLSX_BYTES, ...base };
+    }
+    const buffer = await fs.readFile(abs);
+    const preview = xlsxToDelimited(buffer);
+    if (!preview) return { ok: true, kind: "binary", ...base };
+    return {
+      ok: true,
+      kind: "text",
+      text: preview.text,
+      eol: "lf",
+      bom: false,
+      ...base,
+    };
   }
 
   // PDF 独立于文本 / 二进制判定；损坏或加密文档由 PDF.js 给出明确提示。

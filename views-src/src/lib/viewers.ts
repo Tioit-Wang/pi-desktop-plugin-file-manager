@@ -29,6 +29,8 @@ export const MODE_LABEL: Record<ViewerMode, CopyKey> = {
 };
 
 export function csvDelimiterOf(filePath: string): "," | "\t" | null {
+  // xlsx 由主进程转成制表符文本后再走这张表；视图只按扩展名决定看法。
+  if (/\.xlsx$/i.test(filePath)) return "\t";
   if (/\.csv$/i.test(filePath)) return ",";
   if (/\.tsv$/i.test(filePath)) return "\t";
   return null;
