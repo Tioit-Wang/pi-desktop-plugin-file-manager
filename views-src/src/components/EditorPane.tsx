@@ -224,6 +224,22 @@ export function EditorPane({
           : null
       : null;
 
+  // 工作簿（xlsx）预览读不全时的提示：主进程只回标志与上限数字，文案在这里按
+  // 界面语言渲染——主进程不知道用户说的是哪种语言，它拼出来的只会是中文。
+  const workbook = file?.workbook;
+  const workbookNotices = workbook
+    ? [
+        workbook.incomplete ? t("xlsxIncomplete") : null,
+        workbook.truncated
+          ? t("xlsxTruncated", {
+              sheets: workbook.limits?.sheets ?? 0,
+              rows: workbook.limits?.rows ?? 0,
+              cols: workbook.limits?.cols ?? 0,
+            })
+          : null,
+      ].filter((line): line is string => Boolean(line))
+    : [];
+
   return (
     <section className="relative flex min-h-0 min-w-0 flex-1 flex-col" aria-label={t("title")}>
       <header
@@ -359,6 +375,23 @@ export function EditorPane({
           >
             {t("reload")}
           </button>
+        </div>
+      ) : null}
+
+      {/* 工作簿预览读不全（截断 / 部件缺失）：一条状态提示，不打断表格本身。 */}
+      {workbookNotices.length > 0 ? (
+        <div
+          className="flex flex-none flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2 text-[11.5px]"
+          role="status"
+          style={{
+            background: "color-mix(in oklab, var(--git-modified) 14%, transparent)",
+            color: "var(--fg)",
+            borderBottom: "1px solid var(--border)",
+          }}
+        >
+          {workbookNotices.map((line) => (
+            <span key={line}>{line}</span>
+          ))}
         </div>
       ) : null}
 

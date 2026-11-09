@@ -257,7 +257,16 @@ const main = async () => {
   check(viewers.csvDelimiterOf("a.tsv") === "\t", "TSV 用制表符");
   check(viewers.csvDelimiterOf("a.csv") === ",", "CSV 用逗号");
   check(viewers.csvDelimiterOf("report.XLSX") === "\t", "xlsx 用制表符，大小写不敏感");
-  check(viewers.resolveViewer("report.xlsx", prefs)?.mode === "table", "xlsx 默认落在表格");
+  const xlsxView = viewers.resolveViewer("report.xlsx", prefs);
+  check(
+    same(xlsxView?.modes, ["table"]) && xlsxView?.mode === "table",
+    "xlsx 只有表格一种看法（没有可写的「编辑」页签）",
+    JSON.stringify(xlsxView),
+  );
+  check(
+    viewers.resolveViewer("report.xlsx", { ...prefs, csvTable: false })?.mode === "table",
+    "xlsx 不看偏好：表格是唯一正确的看法",
+  );
   check(viewers.csvDelimiterOf("a.txt") === null, "其他扩展名没有表格视图");
   check(viewers.csvDelimiterOf("a.xls") === null, "老的 xls 不走表格预览");
 

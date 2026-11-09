@@ -13,7 +13,7 @@
  * 用法：pnpm verify:jail
  */
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { deflateRawSync } from "node:zlib";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -245,6 +245,61 @@ async function main() {
   );
   const broken = await onPanelInvoke("fm.read", { path: "broken.xlsx" });
   check("损坏的 xlsx 仍是不支持预览", broken.ok === true && broken.kind === "binary", JSON.stringify(broken).slice(0, 180));
+  check("工作簿是只读的", workbook.readOnly === true, String(workbook.readOnly));
+  check(
+    "主进程不往表格里塞提示文案（文案由视图本地化）",
+    !String(workbook.text).includes("预览已截断") && workbook.workbook === undefined,
+    String(workbook.text).slice(-80),
+  );
+
+  // 视图的「编辑 → 保存」曾经能把派生文本写回 .xlsx，把工作簿变成纯文本。
+  const bytesBefore = readFileSync(join(alpha, "book.xlsx"));
+  const refused = await onPanelInvoke("fm.write", {
+    path: "book.xlsx",
+    text: String(workbook.text),
+    expectedMtimeMs: workbook.mtimeMs,
+    expectedSize: workbook.size,
+  });
+  check("fm.write 拒绝写工作簿", refused.ok === false && refused.code === "READ_ONLY", JSON.stringify(refused).slice(0, 160));
+  check("工作簿字节没被改动", Buffer.compare(bytesBefore, readFileSync(join(alpha, "book.xlsx"))) === 0);
+
+  writeFileSync(join(alpha, "rows.xlsx"), bigSheetWorkbook(5001));
+  const rowsRead = await onPanelInvoke("fm.read", { path: "rows.xlsx" });
+  check(
+    "行数超上限时标记截断，并把上限数字交给视图",
+    rowsRead.ok === true &&
+      rowsRead.workbook?.truncated === true &&
+      rowsRead.workbook?.limits?.rows === 5000 &&
+      String(rowsRead.text).split("\n").length === 5000,
+    JSON.stringify({ workbook: rowsRead.workbook, lines: String(rowsRead.text).split("\n").length }),
+  );
+
+  writeFileSync(join(alpha, "bomb.xlsx"), bombWorkbook(40));
+  const bombRead = await onPanelInvoke("fm.read", { path: "bomb.xlsx" });
+  check(
+    "部件解压超上限按「读不全」处理，不把几十 MB 文本交出去",
+    bombRead.ok === true &&
+      bombRead.kind === "text" &&
+      bombRead.workbook?.incomplete === true &&
+      String(bombRead.text).length < 4096,
+    JSON.stringify({ kind: bombRead.kind, workbook: bombRead.workbook, length: String(bombRead.text).length }),
+  );
+
+  writeFileSync(join(alpha, "missing.xlsx"), missingSheetWorkbook());
+  const missingRead = await onPanelInvoke("fm.read", { path: "missing.xlsx" });
+  check(
+    "工作表部件缺失标记「读不全」，不谎报行列截断",
+    missingRead.ok === true && missingRead.workbook?.incomplete === true && missingRead.workbook?.truncated !== true,
+    JSON.stringify(missingRead.workbook ?? null),
+  );
+
+  writeFileSync(join(alpha, "reversed.xlsx"), reversedRelsWorkbook());
+  const reversedRead = await onPanelInvoke("fm.read", { path: "reversed.xlsx" });
+  check(
+    "关系属性顺序反转也能找到正确的工作表",
+    reversedRead.ok === true && reversedRead.text === "42" && reversedRead.workbook === undefined,
+    JSON.stringify({ text: reversedRead.text, workbook: reversedRead.workbook }),
+  );
 
   console.log(`\n${failures === 0 ? "JAIL VERIFY PASSED" : `${failures} FAILURE(S)`}`);
   process.exitCode = failures === 0 ? 0 : 1;
@@ -317,6 +372,72 @@ function xlsxBuffer() {
     {
       name: "xl/_rels/workbook.xml.rels",
       text: '<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Target="/xl/worksheets/sheet2.xml"/></Relationships>',
+    },
+  ]);
+}
+
+// 一张表 5001 行：验证行上限确实生效，且上限数字交给视图。
+function bigSheetWorkbook(rowCount) {
+  const rows = [];
+  for (let index = 1; index <= rowCount; index += 1) {
+    rows.push(`<row r="${index}"><c r="A${index}"><v>${index}</v></c></row>`);
+  }
+  return zipStore([
+    { name: "xl/worksheets/sheet1.xml", text: `<worksheet><sheetData>${rows.join("")}</sheetData></worksheet>` },
+    { name: "xl/workbook.xml", text: '<workbook><sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>' },
+    {
+      name: "xl/_rels/workbook.xml.rels",
+      text: '<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>',
+    },
+  ]);
+}
+
+// 压缩炸弹：几十 KB 的包解压出几十 MB 的 sharedStrings（压缩比 1000:1 量级）。
+function bombWorkbook(megabytes) {
+  return zipStore([
+    { name: "xl/sharedStrings.xml", text: `<sst><si><t>${"a".repeat(megabytes * 1024 * 1024)}</t></si></sst>` },
+    {
+      name: "xl/worksheets/sheet1.xml",
+      text: '<worksheet><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c></row></sheetData></worksheet>',
+    },
+    { name: "xl/workbook.xml", text: '<workbook><sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>' },
+    {
+      name: "xl/_rels/workbook.xml.rels",
+      text: '<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>',
+    },
+  ]);
+}
+
+// workbook.xml 列了两张表，但第二张的部件在压缩包里根本不存在。
+function missingSheetWorkbook() {
+  return zipStore([
+    {
+      name: "xl/worksheets/sheet1.xml",
+      text: '<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData></worksheet>',
+    },
+    {
+      name: "xl/workbook.xml",
+      text: '<workbook><sheets><sheet name="A" sheetId="1" r:id="rId1"/><sheet name="B" sheetId="2" r:id="rId2"/></sheets></workbook>',
+    },
+    {
+      name: "xl/_rels/workbook.xml.rels",
+      text: '<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Target="worksheets/sheet9.xml"/></Relationships>',
+    },
+  ]);
+}
+
+// 属性顺序反转：Target 写在 Id 前面。XML 属性顺序没有语义，靠正则吃固定顺序的
+// 实现会静默退回 sheet1.xml、读到一张错表。
+function reversedRelsWorkbook() {
+  return zipStore([
+    {
+      name: "xl/worksheets/sheet7.xml",
+      text: '<worksheet><sheetData><row r="1"><c r="A1"><v>42</v></c></row></sheetData></worksheet>',
+    },
+    { name: "xl/workbook.xml", text: '<workbook><sheets><sheet name="R" sheetId="1" r:id="rId9"/></sheets></workbook>' },
+    {
+      name: "xl/_rels/workbook.xml.rels",
+      text: '<Relationships><Relationship Target="worksheets/sheet7.xml" Id="rId9"/></Relationships>',
     },
   ]);
 }

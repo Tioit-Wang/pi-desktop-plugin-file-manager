@@ -51,10 +51,21 @@ const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 const MAX_MEDIA_BYTES = 24 * 1024 * 1024;
 const MAX_PDF_BYTES = 24 * 1024 * 1024;
 const MAX_XLSX_BYTES = 8 * 1024 * 1024;
+/**
+ * 解压后的单个部件上限。文件体积上限只管压缩包：8 MiB 的 xlsx 里一个 repeated
+ * 字符的 sharedStrings 能膨胀到几 GB，不设这道闸门就是给内存留了个洞。
+ */
+const MAX_XLSX_PART_BYTES = 32 * 1024 * 1024;
 const MAX_XLSX_SHEETS = 8;
 const MAX_XLSX_ROWS = 5000;
 const MAX_XLSX_COLS = 60;
 const MAX_XLSX_CELLS = 80000;
+/** 单格文字上限：一个长到几十 MB 的单元格会让整张表只剩它自己。 */
+const MAX_XLSX_CELL_CHARS = 2000;
+/** 整份预览文本上限，与文本预览的 2 MiB 对齐（这份文本还要走 IPC 到视图）。 */
+const MAX_XLSX_TEXT_CHARS = 2 * 1024 * 1024;
+/** 这些扩展名是工作簿容器：读出来的是派生文本，写回只会毁掉文件。 */
+const WORKBOOK_EXT = /^\.(?:xlsx|xlsm|xltx|xltm)$/;
 const MAX_WRITE_BYTES = 8 * 1024 * 1024;
 const MAX_LIST_ENTRIES = 3000;
 /** prefs.projectRoots 最多记多少个项目；超出按最久没用过的淘汰。 */
@@ -2349,6 +2360,9 @@ function asDataUri(mime, buffer) {
 /**
  * 只读 xlsx：解 zip 里的 workbook / sharedStrings / worksheet XML，转成制表符分隔文本。
  * 多张表用空行 + `# 表名` 隔开，现有表格视图会按文本显示。失败返回 null，调用方按二进制提示。
+ *
+ * 返回 { text, truncated, incomplete }：这里**不拼提示文案**——主进程不知道界面语言，
+ * 「截断」与「有部件读不到」由视图按 i18n 渲染（连同上限数字一起）。
  */
 function xlsxToDelimited(buffer) {
   let entries;
@@ -2360,18 +2374,28 @@ function xlsxToDelimited(buffer) {
   const byName = new Map(entries.map((entry) => [entry.name, entry]));
   if (!byName.has("xl/workbook.xml")) return null;
 
-  const workbook = inflateZipEntry(buffer, byName.get("xl/workbook.xml")).toString("utf8");
-  const rels = byName.has("xl/_rels/workbook.xml.rels")
-    ? inflateZipEntry(buffer, byName.get("xl/_rels/workbook.xml.rels")).toString("utf8")
-    : "";
+  let truncated = false;
+  let incomplete = false;
+
+  const workbookPart = inflateZipPart(buffer, byName.get("xl/workbook.xml"));
+  if (!workbookPart) return null; // 连工作簿目录都读不到：按不支持预览处理
+  const workbook = workbookPart.toString("utf8");
+
+  const relsEntry = byName.get("xl/_rels/workbook.xml.rels");
+  const relsPart = relsEntry ? inflateZipPart(buffer, relsEntry) : null;
+  if (relsEntry && !relsPart) incomplete = true;
   const relTargets = new Map();
-  for (const match of rels.matchAll(/Id="([^"]+)"[^>]*Target="([^"]+)"/g)) {
-    relTargets.set(match[1], match[2].replace(/^\/?xl\//, ""));
+  // XML 属性顺序不属于语义：Id 与 Target 各扫一遍，不假设谁写在前面。
+  for (const match of (relsPart ? relsPart.toString("utf8") : "").matchAll(/<Relationship\b[^>]*>/g)) {
+    const id = /\bId="([^"]+)"/.exec(match[0])?.[1];
+    const target = /\bTarget="([^"]+)"/.exec(match[0])?.[1];
+    if (id && target) relTargets.set(id, target.replace(/^\/?xl\//, ""));
   }
 
-  const strings = byName.has("xl/sharedStrings.xml")
-    ? parseSharedStrings(inflateZipEntry(buffer, byName.get("xl/sharedStrings.xml")).toString("utf8"))
-    : [];
+  const stringsEntry = byName.get("xl/sharedStrings.xml");
+  const stringsPart = stringsEntry ? inflateZipPart(buffer, stringsEntry) : null;
+  if (stringsEntry && !stringsPart) incomplete = true;
+  const strings = stringsPart ? parseSharedStrings(stringsPart.toString("utf8")) : [];
 
   const sheets = [];
   for (const match of workbook.matchAll(/<sheet\b[^>]*>/g)) {
@@ -2395,19 +2419,25 @@ function xlsxToDelimited(buffer) {
   const blocks = [];
   let rowsUsed = 0;
   let cellsUsed = 0;
-  let truncated = false;
+  let textUsed = 0;
   for (const sheet of sheets.slice(0, MAX_XLSX_SHEETS)) {
-    if (rowsUsed >= MAX_XLSX_ROWS || cellsUsed >= MAX_XLSX_CELLS) {
+    if (
+      rowsUsed >= MAX_XLSX_ROWS ||
+      cellsUsed >= MAX_XLSX_CELLS ||
+      textUsed >= MAX_XLSX_TEXT_CHARS
+    ) {
       truncated = true;
       break;
     }
     const entry = byName.get(sheet.path);
-    if (!entry) {
-      truncated = true;
+    const part = entry ? inflateZipPart(buffer, entry) : null;
+    if (!part) {
+      // 工作簿里列了这张表，部件却缺失 / 解压超限：这是「读不到」，不是「空表」。
+      incomplete = true;
       continue;
     }
     const parsed = parseWorksheet(
-      inflateZipEntry(buffer, entry).toString("utf8"),
+      part.toString("utf8"),
       strings,
       MAX_XLSX_ROWS - rowsUsed,
       MAX_XLSX_CELLS - cellsUsed,
@@ -2415,14 +2445,25 @@ function xlsxToDelimited(buffer) {
     rowsUsed += parsed.rows.length;
     cellsUsed += parsed.cells;
     if (parsed.truncated) truncated = true;
-    const body = parsed.rows.map((row) => row.map(escapeDelimited).join("\t")).join("\n");
-    blocks.push(sheets.length > 1 ? `# ${sheet.name}\n${body}` : body);
+    const lines = [];
+    if (sheets.length > 1) {
+      textUsed += sheet.name.length + 3;
+      lines.push(`# ${sheet.name}`);
+    }
+    for (const row of parsed.rows) {
+      const line = row.map(escapeDelimited).join("\t");
+      if (textUsed + line.length + 1 > MAX_XLSX_TEXT_CHARS) {
+        truncated = true;
+        break;
+      }
+      textUsed += line.length + 1;
+      lines.push(line);
+    }
+    blocks.push(lines.join("\n"));
   }
   if (sheets.length > MAX_XLSX_SHEETS) truncated = true;
   if (blocks.length === 0) return null;
-  let text = blocks.join("\n\n");
-  if (truncated) text += "\n\n# 预览已截断（最多 8 张表、5000 行、60 列）";
-  return { text };
+  return { text: blocks.join("\n\n"), truncated, incomplete };
 }
 
 function readZipEntries(buffer) {
@@ -2460,8 +2501,25 @@ function inflateZipEntry(buffer, entry) {
   const start = entry.local + 30 + nameLength + extra;
   const data = buffer.subarray(start, start + entry.compressed);
   if (entry.method === 0) return data;
-  if (entry.method === 8) return zlib.inflateRawSync(data);
+  // maxOutputLength 是这里最要紧的一个参数：deflate 的压缩比能到 1000:1 以上，
+  // 只卡压缩包体积（MAX_XLSX_BYTES）挡不住内存被打穿。
+  if (entry.method === 8) return zlib.inflateRawSync(data, { maxOutputLength: MAX_XLSX_PART_BYTES });
   throw new Error(`unsupported zip method ${entry.method}`);
+}
+
+/**
+ * 解压一个部件。超出单部件上限、是宏部件、或压缩方式不认识时返回 null——
+ * 调用方按「这个部件读不到」处理（标记 incomplete），而不是让整次读取抛出去。
+ */
+function inflateZipPart(buffer, entry) {
+  try {
+    return inflateZipEntry(buffer, entry);
+  } catch (error) {
+    if (error?.code === "ERR_BUFFER_TOO_LARGE") return null;
+    if (error?.message === "macro part skipped") return null;
+    if (/^unsupported zip method /.test(String(error?.message))) return null;
+    throw error;
+  }
 }
 
 function parseSharedStrings(xml) {
@@ -2492,7 +2550,13 @@ function parseWorksheet(xml, strings, rowBudget, cellBudget) {
         continue;
       }
       while (row.length < column) row.push("");
-      row[column] = cellText(cell[1], cell[2] ?? "", strings);
+      const value = cellText(cell[1], cell[2] ?? "", strings);
+      if (value.length > MAX_XLSX_CELL_CHARS) {
+        row[column] = value.slice(0, MAX_XLSX_CELL_CHARS);
+        truncated = true;
+      } else {
+        row[column] = value;
+      }
       cells += 1;
       if (cells >= cellBudget) {
         truncated = true;
@@ -2580,12 +2644,16 @@ async function handleRead(payload) {
 
   // xlsx 是 zip，前 4 KiB 含 NUL，旧逻辑会把它当成「二进制、暂不支持预览」。
   // 这里只读工作表文本（共享字符串 / 内联文字 / 数字），交给现有 CSV 表格视图。
-  // 不执行宏、不读 vbaProject.bin、不改原文件。
+  // 不执行宏、不读 vbaProject.bin、不碰原文件。
   if (extension === ".xlsx") {
     if (stat.size > MAX_XLSX_BYTES) {
       return { ok: true, kind: "tooLarge", limit: MAX_XLSX_BYTES, ...base };
     }
     const buffer = await fs.readFile(abs);
+    // stat 与 readFile 之间文件可能长大，PDF 那一支也是这么复核的。
+    if (buffer.length > MAX_XLSX_BYTES) {
+      return { ok: true, kind: "tooLarge", limit: MAX_XLSX_BYTES, ...base, size: buffer.length };
+    }
     const preview = xlsxToDelimited(buffer);
     if (!preview) return { ok: true, kind: "binary", ...base };
     return {
@@ -2594,6 +2662,28 @@ async function handleRead(payload) {
       text: preview.text,
       eol: "lf",
       bom: false,
+      // 工作簿只读：这份文本是从工作簿里派生出来的，不是文件字节，写回会毁掉
+      // 整个 xlsx。视图据此禁用保存并把「编辑」页签从表格视图外摘掉
+      // （views-src/src/lib/viewers.ts）；fm.write 那边还有第二道闸门。
+      readOnly: true,
+      // 截断 / 部件读不到：主进程不拼中文文案，交给视图按界面语言渲染。
+      ...(preview.truncated || preview.incomplete
+        ? {
+            workbook: {
+              ...(preview.truncated
+                ? {
+                    truncated: true,
+                    limits: {
+                      sheets: MAX_XLSX_SHEETS,
+                      rows: MAX_XLSX_ROWS,
+                      cols: MAX_XLSX_COLS,
+                    },
+                  }
+                : {}),
+              ...(preview.incomplete ? { incomplete: true } : {}),
+            },
+          }
+        : {}),
       ...base,
     };
   }
@@ -2693,6 +2783,13 @@ async function atomicWrite(abs, serialized, mode) {
 
 async function handleWrite(payload) {
   const { abs, rel } = await resolveTarget(payload, "write");
+
+  // 工作簿只读的第二道闸门：视图拿到的是从 xlsx 里派生出来的表格文本，不是文件
+  // 字节，写回会把整个工作簿替换成纯文本（数据全丢）。视图已经不给「编辑」页签，
+  // 这里再挡一次，免得日后有人加了个入口就把文件写坏。
+  if (WORKBOOK_EXT.test(path.extname(rel).toLowerCase())) {
+    throw fail("READ_ONLY", "workbook preview is read-only");
+  }
 
   const text = typeof payload?.text === "string" ? payload.text : "";
   if (Buffer.byteLength(text, "utf8") > MAX_WRITE_BYTES) {
