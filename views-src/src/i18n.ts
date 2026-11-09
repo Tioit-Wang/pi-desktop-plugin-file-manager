@@ -61,6 +61,9 @@ export const COPY_TABLES = {
     limitHint: "limit {limit}",
     viewMode: "View",
     tableMode: "Table",
+    xlsxTruncated: "Preview cut short — at most {sheets} sheets, {rows} rows, {cols} columns.",
+    xlsxIncomplete:
+      "Part of this workbook could not be read (a worksheet part is missing or over the size limit), so only what could be read is shown.",
     treeMode: "Tree",
     imageFit: "Fit to view",
     imageActual: "Actual size",
@@ -308,6 +311,8 @@ export const COPY_TABLES = {
     limitHint: "上限 {limit}",
     viewMode: "视图",
     tableMode: "表格",
+    xlsxTruncated: "预览已截断：最多 {sheets} 张表、{rows} 行、{cols} 列。",
+    xlsxIncomplete: "工作簿里有部件读不到（缺少工作表部件或超出体积上限），这里只显示读到的部分。",
     treeMode: "树",
     imageFit: "适应窗口",
     imageActual: "实际大小",

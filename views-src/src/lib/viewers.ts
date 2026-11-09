@@ -29,6 +29,8 @@ export const MODE_LABEL: Record<ViewerMode, CopyKey> = {
 };
 
 export function csvDelimiterOf(filePath: string): "," | "\t" | null {
+  // xlsx 由主进程转成制表符文本后再走这张表；视图只按扩展名决定看法。
+  if (/\.xlsx$/i.test(filePath)) return "\t";
   if (/\.csv$/i.test(filePath)) return ",";
   if (/\.tsv$/i.test(filePath)) return "\t";
   return null;
@@ -36,6 +38,9 @@ export function csvDelimiterOf(filePath: string): "," | "\t" | null {
 
 export function isJson(filePath: string): boolean {
   return /\.(?:json|jsonc|json5)$/i.test(filePath);
+}
+export function isWorkbook(filePath: string): boolean {
+  return /\.(?:xlsx|xlsm|xltx|xltm)$/i.test(filePath);
 }
 
 export type ViewerPrefs = {
@@ -47,6 +52,12 @@ export type ViewerPrefs = {
 export function resolveViewer(filePath: string, prefs: ViewerPrefs): ViewerView | null {
   if (isMarkdown(filePath)) {
     return { modes: ["source", "markdown"], mode: prefs.mdPreview ? "markdown" : "source" };
+  }
+  // 工作簿只有表格这一种看法：主进程给的是派生出来的表格文本，不是文件字节。
+  // 给它一个「编辑」页签，用户就能把纯文本存回 .xlsx，整个工作簿当场报废。
+  // 这条判定不看偏好——表格是唯一正确的看法。
+  if (isWorkbook(filePath)) {
+    return { modes: ["table"], mode: "table" };
   }
   if (csvDelimiterOf(filePath)) {
     return { modes: ["source", "table"], mode: prefs.csvTable ? "table" : "source" };

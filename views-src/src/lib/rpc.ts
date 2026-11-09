@@ -182,6 +182,17 @@ export type TextRead = {
   mtimeMs: number;
   /** 这个文件相对 HEAD 的 git 状态（0.7.0）；没有变化或这里没有 git 时是 null。 */
   git: GitEntryStatus | null;
+  /**
+   * 工作簿预览（xlsx）的截断信息：主进程不拼提示文案——它不知道界面语言，
+   * 只回标志与上限数字，由视图按 i18n 渲染。
+   */
+  workbook?: {
+    /** 命中「表数 / 行数 / 列数 / 单元格数 / 文本长度」上限之一。 */
+    truncated?: boolean;
+    /** 工作簿里列了某张表，但它的部件缺失或超出解压上限：读不全，不是空表。 */
+    incomplete?: boolean;
+    limits?: { sheets: number; rows: number; cols: number };
+  };
 };
 
 /**
@@ -455,6 +466,9 @@ export function failureMessage(failure: Failure, t: T): string {
       return t("errName");
     case "TOO_LARGE":
       return t("tooLarge");
+    case "READ_ONLY":
+      // 工作簿这类「派生文本」的文件：主进程拒绝写回，界面上也不该有入口。
+      return t("readOnly");
     case "CONFLICT":
       return t("conflictTitle");
     case "NOT_FOUND":

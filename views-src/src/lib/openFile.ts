@@ -37,6 +37,12 @@ export type OpenFile = {
   limit?: number;
   /** 仅 sqlite：头部概览，以及宿主运行时是否带 node:sqlite。 */
   sqlite?: { available: boolean; info: SqliteInfo };
+  /** 工作簿预览（xlsx）的截断信息；只有表格预览用它，由 EditorPane 渲染成提示条。 */
+  workbook?: {
+    truncated?: boolean;
+    incomplete?: boolean;
+    limits?: { sheets: number; rows: number; cols: number };
+  };
   /** 每次「从磁盘读进编辑器」递增；保存不动它。 */
   loadToken: number;
 };
@@ -50,7 +56,15 @@ export function toOpenFile(response: ReadResponse, loadToken: number): OpenFile 
   const git = response.kind === "text" ? (response.git ?? null) : null;
 
   if (response.kind === "text") {
-    return { ...base, kind: "text", text: response.text, eol: response.eol, bom: response.bom, git };
+    return {
+      ...base,
+      kind: "text",
+      text: response.text,
+      eol: response.eol,
+      bom: response.bom,
+      git,
+      ...(response.workbook ? { workbook: response.workbook } : {}),
+    };
   }
   if (response.kind === "image" || response.kind === "media" || response.kind === "pdf") {
     return { ...base, ...empty, kind: response.kind, mime: response.mime, dataUri: response.dataUri };
