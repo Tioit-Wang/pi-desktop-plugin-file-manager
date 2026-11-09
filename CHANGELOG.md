@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- The editor's find / replace panel and the "Go to line" dialog (Ctrl/Cmd+Alt+G)
+  follow the plugin palette: fields, placeholders, carets and buttons stay
+  readable in dark and light appearances instead of falling back to CodeMirror's
+  white light-theme defaults. `pnpm verify` now checks the rule in the source CSS
+  and in the shipped `views/assets/index.js`.
+- Fix SSH workspaces remaining on Loading: remote directories and text/image
+  previews now use the paired Host's scoped SDK reads, with explicit read-only
+  controls, upgrade/errors and retry. Local file operations never receive an
+  opaque remote project identity.
+- Discard late previews, ancestor-directory opens and refresh loops after a
+  workspace change. Restore local editor detection, Browser and watch
+  capabilities when returning from a remote project.
+- Show root and nested directory failures with their actual error and Retry
+  action, rather than incorrectly showing Loading indefinitely.
+
 - HTML、HTM 与 XHTML 文件的「通过…打开」菜单新增「在内置浏览器中打开」，仅在宿主提供 Browser API 时显示；与宿主声明的 `fs.read` 文件范围一致。
 - 新增 **xlsx 只读预览**：`.xlsx` 不再被当成二进制。主进程只读取工作表里的共享字符串、内联文字和数字，转成制表符文本后复用现有表格视图；多张表用表名隔开。不改原文件、不执行宏。单文件 8 MiB，最多 8 张表、5000 行、60 列，超出会截断并注明。损坏文件和老的 `.xls` 仍显示不支持预览。
 - 重新整理目录树右键菜单的分组与顺序，并补齐右键刷新；空白区域只显示新建和刷新，文件与文件夹按类型显示操作。
