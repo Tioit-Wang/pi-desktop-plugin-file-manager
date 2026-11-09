@@ -8,7 +8,7 @@
  *
  * 支持：ATX 标题、围栏代码块（带语法高亮）、引用、分隔线、有序/无序/任务
  * 列表（按缩进嵌套）、表格、以及行内的 code / 粗体 / 斜体 / 删除线 / 链接 /
- * 图片。图片不加载（面板是 file://，相对路径指向视图自身），渲染为占位说明。
+ * Images use the existing bounded file-read bridge, relative to the document.
  */
 
 import { useEffect, useState, type ReactNode } from "react";
@@ -17,6 +17,7 @@ import { createElement, Fragment } from "react";
 import type { Base } from "./appearance";
 import { renderHighlighted, tokenizeCode } from "./highlight";
 import { isSafeLink } from "./linkSafety";
+import { loadMarkdownImage } from "./markdownImages";
 
 // ── 行内 ────────────────────────────────────────────────────────────────────
 
@@ -43,7 +44,28 @@ type InlineContext = {
   base: Base;
   onLink: (url: string) => void;
   keyPrefix: string;
+  filePath?: string;
+  workspacePath?: string;
 };
+
+function MarkdownImage({ source, alt, filePath = "", workspacePath = "" }: {
+  source: string; alt: string; filePath?: string; workspacePath?: string;
+}) {
+  const [dataUri, setDataUri] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    void loadMarkdownImage(source, filePath, workspacePath).then(value => {
+      if (!cancelled) setDataUri(value);
+    });
+    return () => { cancelled = true; };
+  }, [source, filePath, workspacePath]);
+  return dataUri
+    ? createElement("img", {
+      src: dataUri, alt, title: source, className: "md-image-preview",
+      onError: () => setDataUri(null),
+    })
+    : createElement("span", { className: "md-image", title: source }, `🖼 ${alt || source}`);
+}
 
 function renderInline(text: string, context: InlineContext): ReactNode[] {
   const nodes: ReactNode[] = [];
@@ -76,14 +98,12 @@ function renderInline(text: string, context: InlineContext): ReactNode[] {
     if (fence !== undefined) {
       nodes.push(createElement("code", { key, className: "md-inline-code" }, codeBody));
     } else if (imageSrc !== undefined) {
-      // 面板以 file:// 加载，相对路径指向视图目录，图片无法加载；
-      // 与其显示一个破图，不如给出可读的占位。
       nodes.push(
-        createElement(
-          "span",
-          { key, className: "md-image", title: imageSrc },
-          `🖼 ${imageAlt || imageSrc}`,
-        ),
+        createElement(MarkdownImage, {
+          key: `${key}:${context.workspacePath}:${context.filePath}:${imageSrc}`,
+          source: imageSrc, alt: imageAlt ?? "",
+          filePath: context.filePath, workspacePath: context.workspacePath,
+        }),
       );
     } else if (linkHref !== undefined) {
       nodes.push(renderLink(linkHref, renderInline(linkText ?? "", { ...context, keyPrefix: key }), key, context));
@@ -478,15 +498,19 @@ export function MarkdownPreview({
   text,
   base,
   onLink,
+  filePath,
+  workspacePath,
 }: {
   text: string;
   base: Base;
   onLink: (url: string) => void;
+  filePath?: string;
+  workspacePath?: string;
 }) {
   const blocks = parseBlocks(text.replace(/\r\n?/g, "\n").split("\n"));
   return createElement(
     Fragment,
     null,
-    ...renderBlocks(blocks, { base, onLink, keyPrefix: "md" }, base),
+    ...renderBlocks(blocks, { base, onLink, filePath, workspacePath, keyPrefix: "md" }, base),
   );
 }

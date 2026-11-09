@@ -1403,6 +1403,7 @@ export default function App() {
           saving={saving}
           error={error}
           activeRoot={activeRoot}
+          workspacePath={root?.path}
           git={openFileGit}
           viewer={viewer}
           tablePageSize={prefs.tablePageSize}

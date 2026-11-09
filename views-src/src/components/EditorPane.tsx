@@ -39,6 +39,7 @@ type Props = {
    */
   externalChange: boolean;
    activeRoot: WorkspaceRoot | null;
+  workspacePath?: string;
   /**
    * 当前文件的 git 状态（0.7.0）。为 null 时工具栏就没有「变更」入口。
    * App 负责算（读文件时带回来的那份，或树里的徽标），这里只管摆出来。
@@ -69,6 +70,7 @@ export function EditorPane({
   file,
    base,
    activeRoot,
+  workspacePath,
   locale,
   dirty,
   saving,
@@ -395,7 +397,9 @@ export function EditorPane({
         {content === "markdown" && file ? (
           <div className="md-scroll">
             <div className="md-body">
-              <MarkdownPreview text={structuredText} base={base} onLink={onLink} />
+              <MarkdownPreview text={structuredText} base={base} onLink={onLink}
+                key={`${activeRoot?.path}:${file.loadToken}`}
+                filePath={file.path} workspacePath={workspacePath} />
             </div>
           </div>
         ) : null}

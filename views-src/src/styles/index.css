@@ -578,6 +578,13 @@ input:focus-visible {
   text-decoration-style: dotted;
 }
 
+.md-image-preview {
+  display: inline-block;
+  max-width: 100%;
+  height: auto;
+  vertical-align: middle;
+}
+
 .md-image {
   display: inline-block;
   border-radius: 6px;
