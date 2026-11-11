@@ -3,9 +3,30 @@ const path = require('node:path');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const assert = require('node:assert/strict');
+const { crc32, deflateSync } = require('node:zlib');
 const from = directory => directory ? createRequire(path.join(directory, 'package.json')) : require;
 const { _electron } = from(process.env.PDF_PLAYWRIGHT_DIR)('playwright');
 const electronBinary = from(process.env.PDF_ELECTRON_DIR)('electron');
+
+function widePng() {
+  const width = 2400, height = 120;
+  const rows = Buffer.alloc((width * 3 + 1) * height);
+  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+    const offset = y * (width * 3 + 1) + 1 + x * 3;
+    rows.set(x < width / 2 ? [40, 140, 220] : [240, 150, 40], offset);
+  }
+  const chunk = (kind, data) => {
+    const payload = Buffer.concat([Buffer.from(kind), data]);
+    const size = Buffer.alloc(4), crc = Buffer.alloc(4);
+    size.writeUInt32BE(data.length); crc.writeUInt32BE(crc32(payload));
+    return Buffer.concat([size, payload, crc]);
+  };
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width); header.writeUInt32BE(height, 4);
+  header[8] = 8; header[9] = 2;
+  return Buffer.concat([Buffer.from('89504e470d0a1a0a', 'hex'), chunk('IHDR', header),
+    chunk('IDAT', deflateSync(rows)), chunk('IEND', Buffer.alloc(0))]);
+}
 
 (async () => {
   const pluginDir = process.env.PDF_PLUGIN_DIR || path.resolve(__dirname, '../..');
@@ -15,7 +36,7 @@ const electronBinary = from(process.env.PDF_ELECTRON_DIR)('electron');
   const notes = path.join(project, 'notes');
   await fs.mkdir(images, { recursive: true });
   await fs.mkdir(notes);
-  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l8sAAAAASUVORK5CYII=', 'base64');
+  const png = widePng();
   for (const file of ['pixel.png', '中文.png']) await fs.writeFile(path.join(images, file), png);
   await fs.writeFile(path.join(temporary, 'outside.png'), png);
   await fs.writeFile(path.join(project, '.env'), png);
@@ -53,7 +74,7 @@ const electronBinary = from(process.env.PDF_ELECTRON_DIR)('electron');
     await page.getByRole('treeitem').filter({ hasText: 'guide.md' }).click();
     await page.getByRole('tab', { name: 'Preview', exact: true }).click();
     await page.waitForFunction(() => document.querySelectorAll('.md-body img').length === 2 &&
-      [...document.querySelectorAll('.md-body img')].every(image => image.complete && image.naturalWidth === 1) &&
+      [...document.querySelectorAll('.md-body img')].every(image => image.complete && image.naturalWidth === 2400) &&
       document.querySelectorAll('.md-body .md-image').length === 8);
     assert.deepEqual(await page.locator('.md-body img').evaluateAll(nodes => nodes.map(image => image.alt)), ['pixel', 'Chinese']);
     assert.equal(await page.locator('.md-body img').evaluateAll(nodes => nodes.every(image => {
@@ -73,7 +94,7 @@ const electronBinary = from(process.env.PDF_ELECTRON_DIR)('electron');
     await page.getByRole('button', { name: 'Reload from disk', exact: true }).click();
     await page.getByRole('heading', { name: 'Reloaded image preview' }).waitFor();
     await page.waitForFunction(() => document.querySelectorAll('.md-body img').length === 3 &&
-      [...document.querySelectorAll('.md-body img')].every(image => image.complete && image.naturalWidth === 1));
+      [...document.querySelectorAll('.md-body img')].every(image => image.complete && image.naturalWidth === 2400));
     if (process.env.PDF_EVIDENCE_DIR) {
       await fs.mkdir(process.env.PDF_EVIDENCE_DIR, { recursive: true });
       await page.screenshot({ path: path.join(process.env.PDF_EVIDENCE_DIR, 'markdown-preview.png') });
