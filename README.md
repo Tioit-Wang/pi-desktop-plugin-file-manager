@@ -96,6 +96,17 @@ the shipped bundle.
 
 > 这个插件没有命令面板入口，也不注册面板窗口——它只提供一个停靠在右侧栏的视图（`contributes.views`）。宿主没有提供「用命令打开视图」的通道，所以这里也不声明误导性的命令。
 
+### Markdown image previews
+
+Project-relative Markdown images render inline through the existing bounded
+`fm.read` bridge, relative to the Markdown document's directory. Parent segments
+may reach another directory inside the selected root. Root escapes, credential
+paths, symlink escapes and oversized files remain denied by the file reader.
+Missing, unreadable, invalid and unsupported images retain their alt-text
+placeholder. Remote URLs, absolute paths and images beside external documents
+remain placeholders; previewing a document grants no new filesystem or network
+access. Reload the document to refresh its images.
+
 ## 开发
 
 ```bash

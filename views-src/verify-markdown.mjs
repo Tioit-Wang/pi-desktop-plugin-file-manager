@@ -8,7 +8,8 @@
  */
 
 import { build } from "esbuild";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -22,7 +23,8 @@ async function loadModule() {
   writeFileSync(
     entry,
     `export { MarkdownPreview } from ${JSON.stringify(join(src, "markdown.tsx"))};\n` +
-      `export { isSafeLink } from ${JSON.stringify(join(src, "linkSafety.ts"))};\n`,
+      `export { isSafeLink } from ${JSON.stringify(join(src, "linkSafety.ts"))};\n` +
+      `export { markdownImagePath, loadMarkdownImage } from ${JSON.stringify(join(src, "markdownImages.ts"))};\n`,
   );
 
   await build({
@@ -79,6 +81,91 @@ const check = (ok, label, detail) => {
 const main = async () => {
   const mod = await loadModule();
   const noop = () => {};
+
+  const imageTree = mod.MarkdownPreview({
+    text: "![figure](./images/fig-02.png)", base: "dark", onLink: noop,
+    filePath: "notes/guide.md", workspacePath: "/synthetic/project",
+  });
+  const image = walk(imageTree).find(item => typeof item === "object" && item.tag === "MarkdownImage");
+  check(Boolean(image), "Markdown image uses the inline preview component");
+  check(image?.props.filePath === "notes/guide.md", "Image retains its Markdown document path");
+  check(image?.props.workspacePath === "/synthetic/project", "Image retains its selected root");
+  for (const [source, expected] of [
+    ["./images/fig-02.png", "notes/images/fig-02.png"],
+    ["../fig%2002.png#anchor", "fig 02.png"],
+    ["../图.png", "图.png"],
+    ["../../outside.png", null], ["%2e%2e/%2e%2e/outside.png", null],
+    ["https://example.com/image.png", null], ["//server/image.png", null],
+    ["file:///tmp/image.png", null], ["C:\\image.png", null],
+    ["data:image/png;base64,AA", null], ["javascript:alert(1)", null],
+    ["%ZZ.png", null], ["image%00.png", null],
+  ]) check(mod.markdownImagePath(source, "notes/guide.md") === expected, `image path: ${source}`);
+  check(mod.markdownImagePath("fig.png", "/outside/guide.md") === null, "External documents cannot grant sibling reads");
+  const previousWindow = globalThis.window;
+  let reads = 0;
+  let response = { ok: true, kind: "image", dataUri: "data:image/png;base64,AA==" };
+  globalThis.window = { pluginBridge: { invoke: async (channel, payload) => {
+    reads++;
+    check(channel === "fm.read", "Images reuse the existing file read channel");
+    check(JSON.stringify(payload) === JSON.stringify({ path: "notes/fig.png", workspacePath: "/synthetic/project" }), "Image reads retain the document root and never set external");
+    return response;
+  } } };
+  try {
+    check(await mod.loadMarkdownImage("fig.png", "notes/guide.md", "/synthetic/project") === response.dataUri, "Image bytes reach the inline renderer");
+    for (const refused of [
+      { ok: false, code: "PERMISSION_DENIED" }, { ok: true, kind: "tooLarge" },
+      { ok: true, kind: "text", text: "private" },
+      { ok: true, kind: "image", dataUri: "https://example.com/leak" },
+    ]) {
+      response = refused;
+      check(await mod.loadMarkdownImage("fig.png", "notes/guide.md", "/synthetic/project") === null, "Unavailable or invalid images retain a placeholder");
+    }
+    const before = reads;
+    await mod.loadMarkdownImage("../../outside.png", "notes/guide.md", "/synthetic/project");
+    check(reads === before, "Escaping paths never reach the bridge");
+    globalThis.window.pluginBridge.invoke = async () => { throw new Error("disconnected"); };
+    check(await mod.loadMarkdownImage("fig.png", "notes/guide.md", "/synthetic/project") === null, "Disconnected bridge retains a placeholder");
+  } finally {
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+  }
+
+  const fixture = mkdtempSync(join(tmpdir(), "pifm-markdown-images-"));
+  const root = join(fixture, "project");
+  const previousPi = globalThis.pi;
+  const plugin = createRequire(import.meta.url)("../main.js");
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=", "base64");
+  mkdirSync(join(root, "notes"), { recursive: true });
+  mkdirSync(join(root, ".ssh"));
+  writeFileSync(join(root, "notes/guide.md"), "![figure](../fig%2002.png)");
+  writeFileSync(join(root, "fig 02.png"), png);
+  writeFileSync(join(root, ".ssh/secret.png"), png);
+  writeFileSync(join(fixture, "outside.png"), png);
+  symlinkSync(join(fixture, "outside.png"), join(root, "escape.png"));
+  writeFileSync(join(root, "large.png"), "");
+  truncateSync(join(root, "large.png"), 64 * 1024 * 1024);
+  globalThis.pi = {
+    workspace: { get: async () => ({ path: root, name: "Synthetic images" }) },
+    plugin: { getDataPath: async () => join(fixture, "data"), getSettings: async () => ({}) },
+    fs: {},
+  };
+  globalThis.window = { pluginBridge: { invoke: (channel, payload) => plugin.onPanelInvoke(channel, payload) } };
+  try {
+    const document = await plugin.onPanelInvoke("fm.read", { path: "notes/guide.md", workspacePath: root });
+    check(document.ok && document.kind === "text", "User journey reads a real Markdown document");
+    const tree = mod.MarkdownPreview({ text: document.text, base: "dark", onLink: noop, filePath: document.path, workspacePath: root });
+    const rendered = walk(tree).find(item => typeof item === "object" && item.tag === "MarkdownImage");
+    check(await mod.loadMarkdownImage(rendered.props.source, rendered.props.filePath, rendered.props.workspacePath) === `data:image/png;base64,${png.toString("base64")}`, "Document-relative preview reads actual PNG bytes through the plugin");
+    for (const source of ["../missing.png", "../.ssh/secret.png", "../escape.png", "../large.png"]) {
+      check(await mod.loadMarkdownImage(source, document.path, root) === null, `Real file reader preserves denial/fallback: ${source}`);
+    }
+  } finally {
+    if (previousPi === undefined) delete globalThis.pi;
+    else globalThis.pi = previousPi;
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+    rmSync(fixture, { recursive: true, force: true });
+  }
 
   console.log("--- 链接白名单 ---");
   const safeLinks = ["https://example.com", "http://a.b/c", "mailto:a@b.c"];

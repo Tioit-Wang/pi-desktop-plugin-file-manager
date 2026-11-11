@@ -1422,6 +1422,7 @@ export default function App() {
           saving={saving}
           error={error}
           activeRoot={root?.remote && activeRoot ? { ...activeRoot, path: root.remote.path } : activeRoot}
+          workspacePath={root?.path}
           git={openFileGit}
           viewer={viewer}
           tablePageSize={prefs.tablePageSize}
