@@ -107,6 +107,12 @@ placeholder. Remote URLs, absolute paths and images beside external documents
 remain placeholders; previewing a document grants no new filesystem or network
 access. Reload the document to refresh its images.
 
+Run `pnpm verify:markdown` in `tests/electron` for the isolated production-view
+journey: decoded relative/encoded images, placeholder fallbacks, document switching,
+reload and external-document isolation. See `tests/electron/README.md` for dependency
+reuse and temporary-profile setup. This is a plugin capability proposal for #11;
+Desktop adoption follows an accepted plugin release.
+
 ## 开发
 
 ```bash
