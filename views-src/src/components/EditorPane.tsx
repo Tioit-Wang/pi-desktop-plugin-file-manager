@@ -9,7 +9,7 @@ import { MODE_LABEL, csvDelimiterOf, type ViewerMode, type ViewerView } from "..
 import { activeTabKey, contentKind, tabs as paneTabs } from "../lib/pane";
 import { isDocumentLoaded, type OpenFile } from "../lib/openFile";
  import { invoke } from "../lib/bridge";
- import { absolutePathOf } from "../lib/roots";
+ import { absoluteFullPath, absolutePathOf } from "../lib/roots";
  import type { WorkspaceRoot } from "../lib/roots";
 import { copyText } from "../lib/clipboard";
 import { CsvTable } from "./CsvTable";
@@ -21,6 +21,9 @@ import { SqliteView } from "./SqliteView";
 import { gitColor, gitGlyph, gitTitle } from "../lib/git";
 import type { GitEntryStatus, GitStatusKind } from "../lib/rpc";
 import { GitDiffView, type DiffViewState } from "./GitDiffView";
+import { ContextMenu } from "./ContextMenu";
+import { isExternalPath } from "../lib/hostOpen";
+import { appendFileLineClipboard, readFileLineSelection, type FileLineReference } from "../lib/file-line-selection";
 
 type Props = {
   file: OpenFile | null;
@@ -39,6 +42,7 @@ type Props = {
    */
   externalChange: boolean;
    activeRoot: WorkspaceRoot | null;
+  workspacePath?: string;
   /**
    * 当前文件的 git 状态（0.7.0）。为 null 时工具栏就没有「变更」入口。
    * App 负责算（读文件时带回来的那份，或树里的徽标），这里只管摆出来。
@@ -69,6 +73,7 @@ export function EditorPane({
   file,
    base,
    activeRoot,
+  workspacePath,
   locale,
   dirty,
   saving,
@@ -93,6 +98,12 @@ export function EditorPane({
   const hostRef = useRef<HTMLDivElement | null>(null);
   // 编辑器里装的是哪一次「从磁盘读进来」的内容；null = 还没装。
   const [loadedToken, setLoadedToken] = useState<number | null>(null);
+  const [selectionMenu, setSelectionMenu] = useState<{
+    x: number;
+    y: number;
+    loadToken: number;
+    reference: FileLineReference;
+  } | null>(null);
 
   // 地址栏的路径要按当前基点展开成绝对路径：基点是主文件夹时它本来就是
   // 工作区相对路径，基点是组里的兄弟文件夹时拼出来才有意义。
@@ -181,6 +192,18 @@ export function EditorPane({
   // 内容区显示哪一种，由 lib/pane.ts 一处说了算（单值，所以不可能同时挂两种）。
   const content = contentKind({ fileKind: file?.kind ?? null, viewerMode: mode, diffOpen });
   const editorHidden = content !== "editor";
+  const matchesSavedFile = !dirty && !saving && !externalChange;
+  const sourceSelection = (target: EventTarget | null) => {
+    const view = handleRef.current?.view;
+    if (!view || !(target instanceof Node) || !view.contentDOM.contains(target) ||
+        editorHidden || !workspacePath || !activeRoot || file?.kind !== "text" ||
+        !isDocumentLoaded(file, loadedToken) || isExternalPath(file.path)) {
+      return null;
+    }
+    return readFileLineSelection(
+      view.state, workspacePath, absoluteFullPath(file.path, activeRoot), matchesSavedFile ? file.text : null,
+    );
+  };
   /**
    * 页签只有一组：**编辑 / 预览（表格、树）/ 变更**。
    *
@@ -420,8 +443,72 @@ export function EditorPane({
         </div>
       ) : null}
 
+      {!matchesSavedFile && !editorHidden && file?.kind === "text" &&
+        window.pluginBridge?.capabilities?.composerFileLines === true ? (
+        <p role="status" className="px-3 py-1 text-xs" style={{ color: "var(--muted)" }}>
+          {t("saveForLineReference")}
+        </p>
+      ) : null}
       <div className="relative min-h-0 flex-1 overflow-hidden">
-        <div ref={hostRef} className="h-full" />
+        <div
+          ref={hostRef}
+          className="h-full"
+          onCopy={(event) => {
+            // CodeMirror writes the plain text and maintains its linewise copy state.
+            if (!event.nativeEvent.isTrusted) return;
+            const reference = sourceSelection(event.target);
+            if (reference && !appendFileLineClipboard(event.clipboardData, reference, event.defaultPrevented)) {
+              void invoke("ui.showToast", { message: t("fileLineCopyFallback"), level: "error" }).catch(() => {});
+            }
+          }}
+          onContextMenu={(event) => {
+            if (!file || !event.nativeEvent.isTrusted ||
+                window.pluginBridge?.capabilities?.composerFileLines !== true) return;
+            const reference = sourceSelection(event.target);
+            if (!reference) return;
+            event.preventDefault();
+            setSelectionMenu({
+              x: event.clientX,
+              y: event.clientY,
+              loadToken: file.loadToken,
+              reference,
+            });
+          }}
+        />
+        {selectionMenu && matchesSavedFile && !editorHidden && selectionMenu.loadToken === file?.loadToken &&
+          selectionMenu.reference.workspace === workspacePath ? (
+          <ContextMenu
+            x={selectionMenu.x}
+            y={selectionMenu.y}
+            onClose={(reason) => {
+              setSelectionMenu(null);
+              if (reason === "escape") handleRef.current?.view.focus();
+            }}
+            entries={[
+              {
+                kind: "item",
+                label: t("addSelectionToChat"),
+                onPick: () => {
+                  void invoke("composer.addFileLines", selectionMenu.reference).catch((cause: unknown) =>
+                    invoke("ui.showToast", {
+                      message: `${t("addSelectionFailed")} ${cause instanceof Error ? cause.message : String(cause)}`,
+                      level: "error",
+                    }).catch(() => {}));
+                },
+              },
+              {
+                kind: "item",
+                label: t("copySelection"),
+                onPick: () => {
+                  handleRef.current?.view.focus();
+                  if (!document.execCommand("copy")) {
+                    void invoke("ui.showToast", { message: t("copySelectionFailed"), level: "error" }).catch(() => {});
+                  }
+                },
+              },
+            ]}
+          />
+        ) : null}
 
         {/* 整块视图只有一个在场上：content 是单值（见 lib/pane.ts），所以这里不可能
             出现「预览与差异叠在一起」。编辑器由 editorHidden 藏起来。 */}

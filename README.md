@@ -85,6 +85,22 @@ the shipped bundle.
 - **忽略规则**：项目里有 `.gitignore` / `.ignore` 就按规则隐藏条目（可用工具栏的眼睛按钮切回显示）；**一个规则文件都没有时，目录树展示全部条目**。
 - **跟随宿主外观**：亮/暗配色与界面语言（中文 / English）跟随 PI-Desktop 主体，编辑器与预览的高亮配色一并跟随。
 
+## 源码选区加入对话
+
+在当前项目的源码编辑器中选中一段文字。复制时会保留原始纯文本，并附带项目路径、文件路径和行号，供支持行引用的宿主识别。宿主支持时，选区右键菜单也会提供「加入对话」。行号从 1 开始，包含起止行。选区刚好结束在下一行开头时，该行不计入。
+
+行引用要求编辑器内容与已保存的文件一致。保存或重新加载后可引用行范围。改动未保存时，复制仍保留普通文本。
+
+宿主通过 `window.pluginBridge.capabilities.composerFileLines` 声明支持右键入口。插件将 `{ workspace, path, start, end }` 传给 `composer.addFileLines`，也将同样的 JSON 写入剪贴板格式 `application/x-pi-desktop-file-lines`。`workspace` 是当前项目路径，`path` 是文件绝对路径。宿主负责验证来源、渲染标签，以及发送后按行读取已保存的文件。
+
+Line references require the host bridge in [PI-Desktop #2129](https://github.com/vastsa/PI-Desktop/pull/2129).
+An eligible view advertises support; each action still checks the active session,
+project, permissions and installed plugin registration. Host rejection reasons
+are shown in the failure toast. `path` may belong to another registered folder
+in the project group and does not have to start with `workspace`.
+Unsaved or externally changed documents show a save/reload hint. If clipboard
+metadata cannot be attached, a toast explains the plain-text fallback.
+
 ## 安装
 
 在 PI-Desktop 的 Plugins 页面：

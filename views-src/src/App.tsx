@@ -795,7 +795,8 @@ export default function App() {
             // 只更新元数据（下一次乐观锁的期望值）与文本，loadToken 不动：
             // 编辑器里的文档就是刚存下去的那份，不该被重装。
             setOpenFile((prev) => (prev ? withSavedContent(prev, response, text) : prev));
-            setDirty(false);
+            setDirty((handleRef.current?.text() ?? text) !== text);
+            setExternalChange(false);
             // 项目外的文件没有对应的树目录要刷新。
             if (!external) void loadDirectory(parentOf(target.path), true);
             // 差异视图正开着这个文件时跟着重取：刚存下的内容就是最新的变更。
@@ -1422,6 +1423,7 @@ export default function App() {
           saving={saving}
           error={error}
           activeRoot={root?.remote && activeRoot ? { ...activeRoot, path: root.remote.path } : activeRoot}
+          workspacePath={root?.path}
           git={openFileGit}
           viewer={viewer}
           tablePageSize={prefs.tablePageSize}
