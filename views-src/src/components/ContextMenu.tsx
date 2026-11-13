@@ -30,7 +30,7 @@ type Props = {
   x: number;
   y: number;
   entries: MenuEntry[];
-  onClose: () => void;
+  onClose: (reason?: "escape") => void;
 };
 
 const MARGIN = 8;
@@ -151,7 +151,7 @@ export function ContextMenu({ x, y, entries, onClose }: Props) {
 
       if (event.key === "Escape") {
         event.preventDefault();
-        dismiss();
+        latest.current.onClose("escape");
         return;
       }
       if (event.key === "ArrowRight") {

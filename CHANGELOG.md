@@ -17,6 +17,12 @@
 - Show root and nested directory failures with their actual error and Retry
   action, rather than incorrectly showing Loading indefinitely.
 
+- Explain line-reference clipboard fallback, show Host rejection reasons, and
+  indicate when saving or reloading is required before referencing source lines.
+
+- Copying saved source selections includes file paths and line ranges while
+  retaining plain text. Supporting Hosts can enable Add to chat; unsaved
+  selections continue to copy plain text only.
 - HTML、HTM 与 XHTML 文件的「通过…打开」菜单新增「在内置浏览器中打开」，仅在宿主提供 Browser API 时显示；与宿主声明的 `fs.read` 文件范围一致。
 - 新增 **xlsx 只读预览**：`.xlsx` 不再被当成二进制。主进程只读取工作表里的共享字符串、内联文字和数字，转成制表符文本后复用现有表格视图；多张表用表名隔开。不改原文件、不执行宏。
   工作簿只有表格这一种看法，主进程也拒绝对 `xlsx` / `xlsm` 写入——它显示的是派生文本，不是文件字节，过去那种「编辑页签 + 保存」会把整个工作簿替换成纯文本。
