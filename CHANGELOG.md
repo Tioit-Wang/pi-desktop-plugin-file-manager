@@ -15,6 +15,8 @@
 
 ## Unreleased
 
+- Drag a regular local file from the tree into a supporting Host's Composer
+  to add a draft reference. Dragging within the tree still moves the entry.
 - Streamline context menus, label the toolbar and add recursive expand/collapse.
   Move files and folders by dragging them within the local tree. Visible folders
   track external additions and removals without a manual refresh.

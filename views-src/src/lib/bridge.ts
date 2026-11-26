@@ -10,6 +10,7 @@ type Bridge = {
   invoke(channel: string, payload?: unknown): Promise<unknown>;
   on(event: string, handler: (payload: unknown) => void): () => void;
   capabilities?: { composerFileLines?: boolean };
+  startComposerFileDrag?(payload: { workspace: string; path: string }): boolean;
 };
 
 declare global {

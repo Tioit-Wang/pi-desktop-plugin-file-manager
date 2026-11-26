@@ -104,6 +104,19 @@ in the project group and does not have to start with `workspace`.
 Unsaved or externally changed documents show a save/reload hint. If clipboard
 metadata cannot be attached, a toast explains the plain-text fallback.
 
+## Drag a file into the Composer
+
+On a supporting Host, drag a regular local file from the tree to the current
+session's Composer to add a removable file reference to its draft. The view
+calls `pluginBridge.startComposerFileDrag({ workspace, path })` during
+`dragstart`, with the project identity and an absolute path from the active
+folder. The Host owns drop admission and the draft. When the method is absent
+or declines the drag, the tree still supports its ordinary internal move.
+Remote files, directories and symbolic links do not start Composer drags.
+The view can still reference a visible file while tree moves are unavailable,
+for example under `node_modules` or while saving an editor tab.
+See [PI-Desktop #2579](https://github.com/vastsa/PI-Desktop/issues/2579).
+
 ## 安装
 
 在 PI-Desktop 的 Plugins 页面：

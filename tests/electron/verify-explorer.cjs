@@ -10,11 +10,21 @@ const electron = from(process.env.PDF_ELECTRON_DIR)('electron');
 (async () => {
   const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'pifm-tree-'));
   const project = path.join(temp, 'project');
+  const composerDrag = process.env.FM_COMPOSER_DRAG_TEST === '1';
+  const dependencies = path.join(project, 'node_modules');
+  const dependency = path.join(dependencies, 'dependency.txt');
+  const symlink = path.join(project, 'linked.txt');
+  const source = path.join(project, 'src', 'deep', 'open.txt');
   let app;
   try {
     await fs.mkdir(path.join(project, 'src', 'deep'), { recursive: true });
     await fs.mkdir(path.join(project, 'dest'));
-    await fs.writeFile(path.join(project, 'src', 'deep', 'open.txt'), 'original');
+    await fs.writeFile(source, 'original');
+    if (composerDrag) {
+      await fs.mkdir(dependencies);
+      await fs.writeFile(dependency, 'dependency');
+      await fs.symlink(source, symlink, 'file');
+    }
     const git = (...args) => require('node:child_process').execFileSync('git', args, { cwd: project, encoding: 'utf8' });
     app = await _electron.launch({ executablePath: electron, args: [path.join(__dirname, 'main.cjs')], env: {
       ...process.env, PDF_FIXTURE_DIR: project, PDF_PROFILE_DIR: path.join(temp, 'profile'),
@@ -27,6 +37,38 @@ const electron = from(process.env.PDF_ELECTRON_DIR)('electron');
     const row = p => page.locator(`[role="treeitem"][data-path="${p}"]`);
     const button = name => page.getByRole('button', { name, exact: true });
     await row('src').waitFor();
+    if (composerDrag) {
+      await row('src').click();
+      await row('src/deep').click();
+      await page.evaluate(() => {
+        window.dragEffects = [];
+        window.addEventListener('dragstart', event => window.dragEffects.push(event.dataTransfer.effectAllowed));
+      });
+      await row('src/deep/open.txt').dragTo(row('src/deep'));
+      await row('src').dragTo(row('src/deep'));
+      await row('node_modules').click();
+      const copyOnly = row('node_modules/dependency.txt');
+      assert.equal(await copyOnly.getAttribute('draggable'), 'true');
+      await copyOnly.dragTo(row('dest'), {
+        sourcePosition: { x: 48, y: 10 },
+        targetPosition: { x: 140, y: 10 },
+      });
+      await row('linked.txt').waitFor();
+      assert.equal(await row('linked.txt').getAttribute('draggable'), 'false');
+      await row('linked.txt').dragTo(row('dest'));
+      assert.deepEqual(await page.evaluate(() => window.dragEffects), ['copyMove', 'move', 'copy']);
+      assert.deepEqual(await page.evaluate(() => window.pluginBridge.testComposerDrags()), [
+        { workspace: project, path: source },
+        { workspace: project, path: dependency },
+      ]);
+      assert.equal(await fs.readFile(source, 'utf8'), 'original');
+      assert.equal(await fs.readFile(dependency, 'utf8'), 'dependency');
+      await fs.unlink(symlink);
+      await fs.unlink(dependency);
+      await fs.rmdir(dependencies);
+      await button('Refresh').click();
+      await row('src').click();
+    }
     const gitTab = page.getByRole('tab', { name: 'Source Control', exact: true });
     const explorer = page.getByRole('tab', { name: 'Explorer', exact: true });
     await gitTab.click();

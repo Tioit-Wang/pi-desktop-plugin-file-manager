@@ -1518,6 +1518,12 @@ export default function App() {
                   <Tree
                     key={activeRoot?.path}
                     onMove={remoteReadOnly || saving ? undefined : moveEntry}
+                    onComposerFileDrag={!remoteReadOnly && root && activeRoot && window.pluginBridge?.startComposerFileDrag
+                      ? (entry) => window.pluginBridge?.startComposerFileDrag?.({
+                        workspace: root.path,
+                        path: absoluteFullPath(entry.path, activeRoot),
+                      }) ?? false
+                      : undefined}
                     directories={directories}
                     expanded={expanded}
                     selected={selected}

@@ -28,6 +28,7 @@ type Props = {
   onOpen: (entry: FileEntry) => void;
   onRefreshDir: (path: string) => void;
   onMove?: (entry: FileEntry, targetDirectory: string) => void;
+  onComposerFileDrag?: (entry: FileEntry) => boolean;
   onContextMenu: (event: React.MouseEvent, entry: FileEntry | null) => void;
 };
 
@@ -95,6 +96,7 @@ export function Tree({
   onOpen,
   onRefreshDir,
   onMove,
+  onComposerFileDrag,
   onContextMenu,
 }: Props) {
   const listRef = useRef<HTMLDivElement | null>(null);
@@ -250,6 +252,8 @@ export function Tree({
         const isSelected = selected === entry.path;
         const isExpanded = expanded.has(entry.path);
         const dimmed = entry.ignored && showIgnored;
+        const canMove = !!onMove && movableEntry(entry);
+        const canReference = !!onComposerFileDrag && !entry.isDirectory && !entry.isSymlink && !entry.outside;
 
         return (
           <button
@@ -272,14 +276,20 @@ export function Tree({
               .filter(Boolean)
               .join(" — ")}
             disabled={entry.isSymlink}
-            draggable={!!onMove && movableEntry(entry)}
+            draggable={canMove || canReference}
             onDragStart={(event) => {
-              if (!onMove || !movableEntry(entry)) { event.preventDefault(); return; }
-              const token = crypto.randomUUID();
-              event.dataTransfer.effectAllowed = "move";
-              event.dataTransfer.setData(DRAG_TYPE, token);
-              setHighlight(null);
-              setDrag({ entry, rows, token });
+              const reference = canReference && onComposerFileDrag?.(entry);
+              if (canMove) {
+                const token = crypto.randomUUID();
+                event.dataTransfer.effectAllowed = reference ? "copyMove" : "move";
+                event.dataTransfer.setData(DRAG_TYPE, token);
+                setHighlight(null);
+                setDrag({ entry, rows, token });
+              } else if (reference) {
+                event.dataTransfer.effectAllowed = "copy";
+              } else {
+                event.preventDefault();
+              }
             }}
             onClick={() => activate(row)}
             onKeyDown={(event) => onKeyDown(event, index, row)}

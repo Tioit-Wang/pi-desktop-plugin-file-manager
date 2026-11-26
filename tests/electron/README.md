@@ -8,6 +8,11 @@
 
 `npm run verify:explorer` checks recursive expand/collapse, native external file creation and deletion, and moving an open dirty document's parent folder via drag-and-drop. It runs the production view and saves the draft to its new path inside a temporary project.
 
+Set `FM_COMPOSER_DRAG_TEST=1` to also exercise the file drag with a synthetic
+Composer bridge. It verifies the absolute path, project identity and the
+coexistence of file-copy and tree-move gestures. Run without that flag to
+exercise the same tree on a Host without the bridge method.
+
 ## Document tabs
 
 After building `views/`, run `npm run verify:doc-tabs` from `tests/electron`.

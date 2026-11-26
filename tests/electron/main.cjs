@@ -54,7 +54,10 @@ app.whenReady().then(async () => {
   });
   const window = new BrowserWindow({ width: 1250, height: 880, show: true, webPreferences: {
     preload: path.join(__dirname, 'preload.cjs'), sandbox: true, contextIsolation: true, nodeIntegration: false,
-    additionalArguments: process.env.FILE_LINES_TEST === '1' ? ['--file-lines-test'] : [],
+    additionalArguments: [
+      ...(process.env.FILE_LINES_TEST === '1' ? ['--file-lines-test'] : []),
+      ...(process.env.FM_COMPOSER_DRAG_TEST === '1' ? ['--composer-file-drag-test'] : []),
+    ],
   } });
   await window.loadFile(path.join(process.env.PDF_PLUGIN_DIR, 'views/index.html'));
 });
